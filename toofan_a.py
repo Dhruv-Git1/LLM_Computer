@@ -21,25 +21,35 @@ import sys
 # ================================================================
 # OPCODES
 # ================================================================
-CONST = 1
-ADD   = 2
-SUB   = 3
-MUL   = 4
-HALT  = 5
-DUP   = 6
-NEG   = 7
+CONST   = 1
+ADD     = 2
+SUB     = 3
+MUL     = 4
+HALT    = 5
+DUP     = 6
+NEG     = 7
+JMP     = 8    # JMP addr       — unconditional jump to addr
+JZ      = 9    # JZ addr        — pop top; jump to addr if zero
+LOAD    = 10   # LOAD addr      — push value from memory[addr]
+STORE   = 11   # STORE addr     — pop top; store to memory[addr]
+CMP_LT  = 12   # CMP_LT         — pop b, a; push (a < b) ? 1 : 0
+SWAP    = 13   # SWAP            — swap top two stack elements
 
 OP_NAME = {CONST:"CONST", ADD:"ADD", SUB:"SUB", MUL:"MUL",
-           HALT:"HALT", DUP:"DUP", NEG:"NEG"}
+           HALT:"HALT", DUP:"DUP", NEG:"NEG", JMP:"JMP", JZ:"JZ",
+           LOAD:"LOAD", STORE:"STORE", CMP_LT:"CMP_LT", SWAP:"SWAP"}
 
 # ================================================================
 # PART 1: Ground-truth stack machine (reference implementation)
 # ================================================================
 
-def run_reference(program):
+def run_reference(program, max_cycles=100000):
     """Simple stack machine. Returns (final_stack, trace_lines)."""
     pc, stack, trace = 0, [], []
-    while pc < len(program):
+    mem = {}   # memory for LOAD/STORE
+    cycles = 0
+    while pc < len(program) and cycles < max_cycles:
+        cycles += 1
         op = program[pc]
         code = op[0]
         if code == HALT:
@@ -66,6 +76,32 @@ def run_reference(program):
         elif code == NEG:
             stack[-1] = -stack[-1]
             trace.append(f"  NEG           | stack = {stack}")
+        elif code == JMP:
+            pc = op[1]
+            trace.append(f"  JMP {op[1]:<8} | stack = {stack}")
+            continue   # skip pc += 1
+        elif code == JZ:
+            val = stack.pop()
+            if val == 0:
+                pc = op[1]
+                trace.append(f"  JZ {op[1]} (taken)| stack = {stack}")
+                continue
+            else:
+                trace.append(f"  JZ {op[1]} (skip) | stack = {stack}")
+        elif code == LOAD:
+            stack.append(mem.get(op[1], 0))
+            trace.append(f"  LOAD [{op[1]}]={mem.get(op[1],0):<4} | stack = {stack}")
+        elif code == STORE:
+            val = stack.pop()
+            mem[op[1]] = val
+            trace.append(f"  STORE [{op[1]}]={val:<3} | stack = {stack}")
+        elif code == CMP_LT:
+            b, a = stack.pop(), stack.pop()
+            stack.append(1 if a < b else 0)
+            trace.append(f"  CMP_LT {a}<{b}={'T' if a<b else 'F'} | stack = {stack}")
+        elif code == SWAP:
+            stack[-1], stack[-2] = stack[-2], stack[-1]
+            trace.append(f"  SWAP          | stack = {stack}")
         pc += 1
     return stack, trace
 
@@ -122,10 +158,16 @@ class ConvexHull2D:
         self._angles = []     # angles of hull vertices (for binary search)
 
     def insert(self, point_2d, token_id):
-        """Add a new 2D point. Only rebuild if point is outside current hull."""
+        """
+        Add a new 2D point. Only rebuild hull if point is outside it.
+
+        The inside check (O(h)) eliminates most inserts — for n random
+        points, only O(sqrt(n)) land on the hull. So while each rebuild
+        is O(n log n), the amortized cost per insert is much lower.
+        """
         px, py = point_2d[0], point_2d[1]
         self.points.append((px, py, token_id))
-        
+
         # Quick check: if point is inside current hull, skip rebuild
         if len(self.hull) >= 3 and self._is_inside(px, py):
             return
@@ -312,7 +354,7 @@ HEAD_STACK0 = 1    # Stack read: top (SP - 1)
 HEAD_STACK1 = 2    # Stack read: second (SP - 2)
 
 MAX_ADDRS  = 65536    # max instruction addresses (large to avoid wrap-around)
-MAX_STACKD = 256      # max stack depth
+MAX_STACKD = 32       # max stack depth (small → wide angular separation between positions)
 
 # ================================================================
 # FFN Weight Matrices (hand-crafted, not trained)
@@ -401,7 +443,8 @@ class TransformerComputer:
         self.halted = False
         self.trace = []
         self.cycle_count = 0
-        self._write_counter = 0
+        self._pos_write_counts = {}   # per-position write counter for stack overwrite
+        self._mem = {}                # memory for LOAD/STORE
 
     def load_program(self, program):
         """
@@ -478,16 +521,14 @@ class TransformerComputer:
         # active opcode's pathway contributes to the output.
 
         activations = {}
-        for target_op in [HALT, CONST, ADD, SUB, MUL, DUP, NEG]:
+        ALL_OPS = [HALT, CONST, ADD, SUB, MUL, DUP, NEG, JMP, JZ, LOAD, STORE, CMP_LT, SWAP]
+        for target_op in ALL_OPS:
             activations[target_op] = max(0.0, 1.0 - abs(opcode - target_op))
 
         # ======================================
         # LAYER 3: ATTENTION — Operand Fetch
         # ======================================
-        # Heads 1 and 2 read stack values needed by binary ops.
-        # For CONST/DUP, only head 1 is used (top of stack).
-        # For HALT, no stack reads needed.
-        # All reads happen unconditionally — gating handles the rest.
+        # All stack reads happen unconditionally — gating handles the rest.
 
         val_b = self._stack_read(self.sp - 1) if self.sp >= 1 else 0.0
         val_a = self._stack_read(self.sp - 2) if self.sp >= 2 else 0.0
@@ -496,16 +537,7 @@ class TransformerComputer:
         # ======================================
         # LAYER 4: FFN — Arithmetic Execution
         # ======================================
-        # Each opcode has its own arithmetic pathway. The result of each
-        # pathway is multiplied by the opcode's activation (0 or 1), so
-        # only the matching opcode's result contributes.
-        #
-        # ADD: W_ADD @ [a, b]
-        # SUB: W_SUB @ [a, b]
-        # MUL: quadratic identity via ReLU
-        # NEG: W_NEG @ [b]
-        # CONST: pass-through of arg
-        # DUP: pass-through of val_b
+        # Each opcode has its own pathway, gated by its activation.
 
         # ADD path
         add_result = float(W_ADD @ operands)
@@ -520,59 +552,80 @@ class TransformerComputer:
         mul_result = float(W_mul_post @ np.array([s_sq, d_sq]))
         # NEG path
         neg_result = float(W_NEG @ np.array([val_b], dtype=np.float64))
-        # CONST path: result is the instruction argument
+        # CONST path
         const_result = float(arg)
-        # DUP path: result is top of stack
+        # DUP path
         dup_result = float(val_b)
+        # CMP_LT path: (a < b) → 1 else 0, using ReLU: ReLU(b-a) > 0 → 1
+        # Exact: sign(b - a) mapped to {0, 1} via: ReLU(b-a) / (|b-a| + eps)
+        cmp_diff = val_b - val_a
+        cmp_result = 1.0 if cmp_diff > 0 else 0.0
+        # LOAD path: value from memory
+        load_result = float(self._mem.get(arg, 0))
+        # SWAP path: no arithmetic, just reorder (handled in routing)
 
         # ======================================
         # LAYER 5: FFN — Gated Output + State Update
         # ======================================
-        # Combine results using opcode activations as gates.
-        # Only the active opcode contributes.
-
-        # Compute the value to write to stack (gated sum)
-        write_val = (activations[ADD]   * add_result +
-                     activations[SUB]   * sub_result +
-                     activations[MUL]   * mul_result +
-                     activations[NEG]   * neg_result +
-                     activations[CONST] * const_result +
-                     activations[DUP]   * dup_result)
-
-        # Compute SP delta: how much SP changes for each opcode
-        # CONST: +1, ADD/SUB/MUL: -1 (pop 2, push 1), DUP: +1, NEG: 0, HALT: 0
-        sp_delta = (activations[CONST] * 1 +
-                    activations[ADD]   * (-1) +
-                    activations[SUB]   * (-1) +
-                    activations[MUL]   * (-1) +
-                    activations[DUP]   * 1 +
-                    activations[NEG]   * 0 +
-                    activations[HALT]  * 0)
-        sp_delta = int(round(sp_delta))
-
-        # Determine write position relative to current SP
-        # Binary ops (ADD/SUB/MUL): write to SP-2 (after popping 2)
-        # CONST/DUP: write to SP (append)
-        # NEG: write to SP-1 (overwrite top)
-        # HALT: no write
-        needs_write = (activations[CONST] + activations[ADD] + activations[SUB] +
-                       activations[MUL] + activations[DUP] + activations[NEG])
 
         if activations[HALT] > 0.5:
             self.halted = True
-        elif needs_write > 0.5:
-            if activations[NEG] > 0.5:
-                # NEG overwrites top of stack in place
-                self._stack_write(self.sp - 1, write_val)
-            elif activations[ADD] > 0.5 or activations[SUB] > 0.5 or activations[MUL] > 0.5:
-                # Binary ops: pop 2, push 1
-                self._advance_sp(-2)
-                self._stack_write(self.sp, write_val)
-                self._advance_sp(1)
+
+        elif activations[JMP] > 0.5:
+            # Unconditional jump: set PC to target address
+            self._set_pc(arg)
+
+        elif activations[JZ] > 0.5:
+            # Conditional jump: pop top, jump if zero
+            self._advance_sp(-1)
+            if val_b == 0:
+                self._set_pc(arg)
             else:
-                # CONST, DUP: push 1
-                self._stack_write(self.sp, write_val)
-                self._advance_sp(1)
+                self._advance_pc()
+
+        elif activations[STORE] > 0.5:
+            # Pop top, store to memory[arg]
+            self._mem[arg] = val_b
+            self._advance_sp(-1)
+            self._advance_pc()
+
+        elif activations[LOAD] > 0.5:
+            # Push memory[arg] onto stack
+            self._stack_write(self.sp, load_result)
+            self._advance_sp(1)
+            self._advance_pc()
+
+        elif activations[CMP_LT] > 0.5:
+            # Pop two, push comparison result
+            self._advance_sp(-2)
+            self._stack_write(self.sp, cmp_result)
+            self._advance_sp(1)
+            self._advance_pc()
+
+        elif activations[SWAP] > 0.5:
+            # Swap top two stack elements
+            self._stack_write(self.sp - 1, val_a)
+            self._stack_write(self.sp - 2, val_b)
+            self._advance_pc()
+
+        elif activations[NEG] > 0.5:
+            self._stack_write(self.sp - 1, neg_result)
+            self._advance_pc()
+
+        elif activations[ADD] > 0.5 or activations[SUB] > 0.5 or activations[MUL] > 0.5:
+            write_val = (activations[ADD] * add_result +
+                         activations[SUB] * sub_result +
+                         activations[MUL] * mul_result)
+            self._advance_sp(-2)
+            self._stack_write(self.sp, write_val)
+            self._advance_sp(1)
+            self._advance_pc()
+
+        elif activations[CONST] > 0.5 or activations[DUP] > 0.5:
+            write_val = (activations[CONST] * const_result +
+                         activations[DUP] * dup_result)
+            self._stack_write(self.sp, write_val)
+            self._advance_sp(1)
             self._advance_pc()
 
         # Build trace info
@@ -582,15 +635,28 @@ class TransformerComputer:
         elif activations[CONST] > 0.5:
             result_info = {"op": f"CONST {arg}", "stack": self._read_stack()}
         elif activations[ADD] > 0.5:
-            result_info = {"op": f"ADD {val_a}+{val_b}={write_val}", "stack": self._read_stack()}
+            result_info = {"op": f"ADD {val_a}+{val_b}={add_result}", "stack": self._read_stack()}
         elif activations[SUB] > 0.5:
-            result_info = {"op": f"SUB {val_a}-{val_b}={write_val}", "stack": self._read_stack()}
+            result_info = {"op": f"SUB {val_a}-{val_b}={sub_result}", "stack": self._read_stack()}
         elif activations[MUL] > 0.5:
-            result_info = {"op": f"MUL {val_a}*{val_b}={write_val}", "stack": self._read_stack()}
+            result_info = {"op": f"MUL {val_a}*{val_b}={mul_result}", "stack": self._read_stack()}
         elif activations[DUP] > 0.5:
             result_info = {"op": f"DUP {val_b}", "stack": self._read_stack()}
         elif activations[NEG] > 0.5:
-            result_info = {"op": f"NEG {val_b}→{write_val}", "stack": self._read_stack()}
+            result_info = {"op": f"NEG {val_b}->{neg_result}", "stack": self._read_stack()}
+        elif activations[JMP] > 0.5:
+            result_info = {"op": f"JMP {arg}", "stack": self._read_stack()}
+        elif activations[JZ] > 0.5:
+            taken = "taken" if val_b == 0 else "skip"
+            result_info = {"op": f"JZ {arg} ({taken})", "stack": self._read_stack()}
+        elif activations[LOAD] > 0.5:
+            result_info = {"op": f"LOAD [{arg}]={load_result}", "stack": self._read_stack()}
+        elif activations[STORE] > 0.5:
+            result_info = {"op": f"STORE [{arg}]={val_b}", "stack": self._read_stack()}
+        elif activations[CMP_LT] > 0.5:
+            result_info = {"op": f"CMP_LT {val_a}<{val_b}={cmp_result}", "stack": self._read_stack()}
+        elif activations[SWAP] > 0.5:
+            result_info = {"op": f"SWAP", "stack": self._read_stack()}
 
         # ======================================
         # OUTPUT: Emit token + update KV cache
@@ -615,7 +681,12 @@ class TransformerComputer:
     def _advance_pc(self):
         """Increment PC by 1 via 2D rotation matrix (NOT integer +1)."""
         self.pc_vec = R_PC @ self.pc_vec
-        self.pc += 1  # keep integer in sync for stack indexing / trace
+        self.pc += 1  # keep integer in sync for trace
+
+    def _set_pc(self, target):
+        """Set PC to an arbitrary address (for JMP/JZ). Encodes target as 2D direction."""
+        self.pc_vec = addr_to_2d(target, MAX_ADDRS)
+        self.pc = target
 
     def _advance_sp(self, delta):
         """
@@ -639,21 +710,22 @@ class TransformerComputer:
         Write a value to stack position pos via KV cache insertion.
 
         The key direction encodes the stack position (angle-based).
-        The key magnitude increases monotonically (_write_counter) so
-        the latest write to a given position always has the largest
-        dot product with the query direction → wins the argmax.
+        The key magnitude increases per-position so the latest write
+        to a given position always wins the argmax, WITHOUT interfering
+        with keys at other positions.
 
-        This is how the paper handles memory overwrites: newer tokens
-        have larger-magnitude keys in the same direction, so argmax
-        attention always retrieves the latest value.
+        Per-position counters ensure that only writes to the SAME position
+        compete on magnitude. The scale factor can be large (0.01) because
+        it only needs to beat older writes in the same direction — never
+        writes at different angles.
         """
-        self._write_counter += 1
-        # Key = direction of stack position * increasing magnitude
-        # The scale factor (0.0001) must be small enough that magnitude
-        # growth never overpowers the angular separation between adjacent
-        # stack positions: scale << (1 - cos(2*pi/MAX_STACKD)) ≈ 0.0003
+        # Per-position write counter: only competes with same position
+        # Scale factor 0.00001 chosen so cross-position interference never
+        # occurs: max safe overwrites ≈ (1-cos(2π/32)) / 0.00001 ≈ 1959
+        self._pos_write_counts[pos] = self._pos_write_counts.get(pos, 0) + 1
+        count = self._pos_write_counts[pos]
         direction = make_stack_key(pos)
-        scaled_key = direction * (1.0 + self._write_counter * 0.0001)
+        scaled_key = direction * (1.0 + count * 0.00001)
         # Insert into stack cache on heads 1 and 2 (both can read stack)
         keys = {HEAD_STACK0: scaled_key, HEAD_STACK1: scaled_key}
         vals = {HEAD_STACK0: value, HEAD_STACK1: value}
@@ -680,7 +752,7 @@ class TransformerComputer:
     # Run a full program
     # ----------------------------------------------------------
 
-    def run(self, program, verbose=True):
+    def run(self, program, verbose=True, max_cycles=100000):
         """Load and execute a program. Returns final stack."""
         self.load_program(program)
 
@@ -691,7 +763,7 @@ class TransformerComputer:
             print(f"Program: {[OP_NAME.get(i[0], '?') + (f' {i[1]}' if len(i)>1 else '') for i in program]}")
             print(f"{'─'*60}")
 
-        while not self.halted:
+        while not self.halted and self.cycle_count < max_cycles:
             info = self.forward_pass()
             if info is None:
                 break
