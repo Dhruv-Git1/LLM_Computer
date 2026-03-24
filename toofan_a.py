@@ -185,17 +185,41 @@ class ConvexHull2D:
     def query(self, direction_2d):
         """
         Find the hull vertex that maximizes dot(direction, vertex).
-        Brute-force over hull vertices — O(h) where h = hull size.
-        Hull size is typically O(sqrt(n)), so this is still much faster
-        than scanning all n points.
+        O(log h) via binary search on the angle-sorted hull vertices.
+
+        Algorithm: binary search _angles for the query's angle, then
+        check a small neighborhood (±2 vertices) to find the exact max.
+        For convex hull vertices with near-unit magnitude, the optimal
+        vertex is always within ±1 of the angle-nearest vertex.
+
         Returns token_id of best match.
         """
-        if len(self.hull) == 0:
+        import bisect
+
+        h = len(self.hull)
+        if h == 0:
             return -1
+        if h <= 3:
+            best_id = -1
+            best_dot = -np.inf
+            for hx, hy, tid in self.hull:
+                d = direction_2d[0] * hx + direction_2d[1] * hy
+                if d > best_dot:
+                    best_dot = d
+                    best_id = tid
+            return best_id
+
+        # Binary search for query angle in the sorted hull angles — O(log h)
+        query_angle = np.arctan2(direction_2d[1], direction_2d[0])
+        pos = bisect.bisect_left(self._angles, query_angle)
+
+        # Check neighbors (±2) around the insertion point, wrapping around
         best_id = -1
         best_dot = -np.inf
-        for hx, hy, tid in self.hull:
-            d = direction_2d[0]*hx + direction_2d[1]*hy
+        for offset in range(-2, 3):
+            idx = (pos + offset) % h
+            hx, hy, tid = self.hull[idx]
+            d = direction_2d[0] * hx + direction_2d[1] * hy
             if d > best_dot:
                 best_dot = d
                 best_id = tid
@@ -290,6 +314,29 @@ HEAD_STACK1 = 2    # Stack read: second (SP - 2)
 MAX_ADDRS  = 65536    # max instruction addresses (large to avoid wrap-around)
 MAX_STACKD = 256      # max stack depth
 
+# ================================================================
+# FFN Weight Matrices (hand-crafted, not trained)
+# ================================================================
+# These are the actual weight matrices that implement arithmetic
+# in the FFN layer. Each is applied via matrix multiplication.
+
+W_ADD = np.array([1.0, 1.0], dtype=np.float64)    # result = W_ADD @ [a, b] = a + b
+W_SUB = np.array([1.0, -1.0], dtype=np.float64)   # result = W_SUB @ [a, b] = a - b
+W_NEG = np.array([-1.0], dtype=np.float64)         # result = W_NEG @ [a]    = -a
+
+# PC rotation matrix: rotates the 2D PC direction by delta_theta = 2*pi/MAX_ADDRS
+# Applying R_PC to the current PC vector = incrementing PC by 1
+_dtheta_pc = 2.0 * np.pi / MAX_ADDRS
+R_PC = np.array([[np.cos(_dtheta_pc), -np.sin(_dtheta_pc)],
+                 [np.sin(_dtheta_pc),  np.cos(_dtheta_pc)]], dtype=np.float64)
+
+# SP rotation matrix: rotates the 2D SP direction by delta_theta = 2*pi/MAX_STACKD
+_dtheta_sp = 2.0 * np.pi / MAX_STACKD
+R_SP_INC = np.array([[np.cos(_dtheta_sp), -np.sin(_dtheta_sp)],
+                     [np.sin(_dtheta_sp),  np.cos(_dtheta_sp)]], dtype=np.float64)
+# SP decrement = rotate backwards (transpose of R_SP_INC since it's orthogonal)
+R_SP_DEC = R_SP_INC.T
+
 def make_instr_key(addr):
     """2D key encoding an instruction address."""
     return addr_to_2d(addr, MAX_ADDRS)
@@ -341,10 +388,16 @@ class TransformerComputer:
             self.instr_cache = HullKVCache(n_heads=1)
         else:
             self.instr_cache = NaiveKVCache(n_heads=1)
-        # Stack: simple dict-based (small, frequently overwritten)
-        self._stack_mem = {}
+        # Stack cache: attention-based memory using heads 1 and 2
+        # Uses NaiveKVCache (not hull) because stack keys get magnitude-scaled
+        # for overwrite semantics, which breaks the unit-circle assumption of hulls
+        self.stack_cache = NaiveKVCache(n_heads=3)
+        # PC and SP stored as 2D direction vectors (as in the paper)
+        # Integer counters kept in sync for trace output
         self.pc = 0
+        self.pc_vec = addr_to_2d(0, MAX_ADDRS)   # 2D direction for PC
         self.sp = 0
+        self.sp_vec = make_stack_key(0)           # 2D direction for SP
         self.halted = False
         self.trace = []
         self.cycle_count = 0
@@ -400,9 +453,8 @@ class TransformerComputer:
         #   query = W_Q @ state_vector
         #   where W_Q extracts the PC dims and converts to 2D direction
         #
-        # Here: make_instr_query(self.pc) IS that W_Q projection.
-
-        query_instr = make_instr_query(self.pc)
+        # The pc_vec IS the query direction — W_Q is identity on PC dims.
+        query_instr = self.pc_vec
         fetched = self.instr_cache.query(0, query_instr)
 
         if fetched is None:
@@ -415,92 +467,130 @@ class TransformerComputer:
         # (In a real transformer, the value vector adds this info to the residual stream)
 
         # ======================================
-        # LAYER 2: FFN — Decode + Execute
+        # LAYER 2: FFN — Opcode Decode via ReLU
         # ======================================
-        # The FFN weights implement a lookup table:
-        #   if opcode == CONST → push arg onto stack
-        #   if opcode == ADD   → pop two, add, push result
-        #   if opcode == SUB   → pop two, subtract, push result
-        #   etc.
+        # The FFN hidden layer has one detector neuron per opcode.
+        # Each neuron fires via: activation = ReLU(1 - |opcode - target|)
+        # This gives exactly 1.0 for the matching opcode and 0.0 for all
+        # others (since opcodes are integers with spacing >= 1).
         #
-        # This is: hidden = ReLU(W1 @ [opcode, arg, stack_vals] + b1)
-        #          output = W2 @ hidden + b2
-        # where W1 has one row per opcode (detector neurons)
-        # and W2 routes each detector to the right output action.
+        # The activations gate all downstream computation — only the
+        # active opcode's pathway contributes to the output.
 
-        result_info = {}
+        activations = {}
+        for target_op in [HALT, CONST, ADD, SUB, MUL, DUP, NEG]:
+            activations[target_op] = max(0.0, 1.0 - abs(opcode - target_op))
 
-        if opcode == HALT:
+        # ======================================
+        # LAYER 3: ATTENTION — Operand Fetch
+        # ======================================
+        # Heads 1 and 2 read stack values needed by binary ops.
+        # For CONST/DUP, only head 1 is used (top of stack).
+        # For HALT, no stack reads needed.
+        # All reads happen unconditionally — gating handles the rest.
+
+        val_b = self._stack_read(self.sp - 1) if self.sp >= 1 else 0.0
+        val_a = self._stack_read(self.sp - 2) if self.sp >= 2 else 0.0
+        operands = np.array([val_a, val_b], dtype=np.float64)
+
+        # ======================================
+        # LAYER 4: FFN — Arithmetic Execution
+        # ======================================
+        # Each opcode has its own arithmetic pathway. The result of each
+        # pathway is multiplied by the opcode's activation (0 or 1), so
+        # only the matching opcode's result contributes.
+        #
+        # ADD: W_ADD @ [a, b]
+        # SUB: W_SUB @ [a, b]
+        # MUL: quadratic identity via ReLU
+        # NEG: W_NEG @ [b]
+        # CONST: pass-through of arg
+        # DUP: pass-through of val_b
+
+        # ADD path
+        add_result = float(W_ADD @ operands)
+        # SUB path
+        sub_result = float(W_SUB @ operands)
+        # MUL path: a*b = ((a+b)^2 - (a-b)^2) / 4
+        W_mul_pre = np.array([[1.0, 1.0], [1.0, -1.0]], dtype=np.float64)
+        sd = W_mul_pre @ operands
+        s_sq = max(0.0, sd[0])**2 + max(0.0, -sd[0])**2
+        d_sq = max(0.0, sd[1])**2 + max(0.0, -sd[1])**2
+        W_mul_post = np.array([0.25, -0.25], dtype=np.float64)
+        mul_result = float(W_mul_post @ np.array([s_sq, d_sq]))
+        # NEG path
+        neg_result = float(W_NEG @ np.array([val_b], dtype=np.float64))
+        # CONST path: result is the instruction argument
+        const_result = float(arg)
+        # DUP path: result is top of stack
+        dup_result = float(val_b)
+
+        # ======================================
+        # LAYER 5: FFN — Gated Output + State Update
+        # ======================================
+        # Combine results using opcode activations as gates.
+        # Only the active opcode contributes.
+
+        # Compute the value to write to stack (gated sum)
+        write_val = (activations[ADD]   * add_result +
+                     activations[SUB]   * sub_result +
+                     activations[MUL]   * mul_result +
+                     activations[NEG]   * neg_result +
+                     activations[CONST] * const_result +
+                     activations[DUP]   * dup_result)
+
+        # Compute SP delta: how much SP changes for each opcode
+        # CONST: +1, ADD/SUB/MUL: -1 (pop 2, push 1), DUP: +1, NEG: 0, HALT: 0
+        sp_delta = (activations[CONST] * 1 +
+                    activations[ADD]   * (-1) +
+                    activations[SUB]   * (-1) +
+                    activations[MUL]   * (-1) +
+                    activations[DUP]   * 1 +
+                    activations[NEG]   * 0 +
+                    activations[HALT]  * 0)
+        sp_delta = int(round(sp_delta))
+
+        # Determine write position relative to current SP
+        # Binary ops (ADD/SUB/MUL): write to SP-2 (after popping 2)
+        # CONST/DUP: write to SP (append)
+        # NEG: write to SP-1 (overwrite top)
+        # HALT: no write
+        needs_write = (activations[CONST] + activations[ADD] + activations[SUB] +
+                       activations[MUL] + activations[DUP] + activations[NEG])
+
+        if activations[HALT] > 0.5:
             self.halted = True
+        elif needs_write > 0.5:
+            if activations[NEG] > 0.5:
+                # NEG overwrites top of stack in place
+                self._stack_write(self.sp - 1, write_val)
+            elif activations[ADD] > 0.5 or activations[SUB] > 0.5 or activations[MUL] > 0.5:
+                # Binary ops: pop 2, push 1
+                self._advance_sp(-2)
+                self._stack_write(self.sp, write_val)
+                self._advance_sp(1)
+            else:
+                # CONST, DUP: push 1
+                self._stack_write(self.sp, write_val)
+                self._advance_sp(1)
+            self._advance_pc()
+
+        # Build trace info
+        result_info = {}
+        if activations[HALT] > 0.5:
             result_info = {"op": "HALT", "stack": self._read_stack()}
-
-        elif opcode == CONST:
-            # PUSH: write arg to stack at position SP
-            # This is a "memory write" — we create a new token in the cache
-            # whose key encodes stack position SP and value carries arg.
-            self._stack_write(self.sp, arg)
-            self.sp += 1
-            self.pc += 1
+        elif activations[CONST] > 0.5:
             result_info = {"op": f"CONST {arg}", "stack": self._read_stack()}
-
-        elif opcode == ADD:
-            # POP two values via attention lookup on stack heads
-            # Head 1 queries stack[SP-1], Head 2 queries stack[SP-2]
-            val_b = self._stack_read(self.sp - 1)    # attention head 1
-            val_a = self._stack_read(self.sp - 2)    # attention head 2
-
-            # FFN arithmetic: result = W_add @ [val_a, val_b]
-            # where W_add = [1, 1] (a row of ones = addition)
-            result = val_a + val_b
-
-            # Write result back to stack
-            self.sp -= 2
-            self._stack_write(self.sp, result)
-            self.sp += 1
-            self.pc += 1
-            result_info = {"op": f"ADD {val_a}+{val_b}={result}", "stack": self._read_stack()}
-
-        elif opcode == SUB:
-            val_b = self._stack_read(self.sp - 1)
-            val_a = self._stack_read(self.sp - 2)
-            # FFN: W_sub = [1, -1]
-            result = val_a - val_b
-            self.sp -= 2
-            self._stack_write(self.sp, result)
-            self.sp += 1
-            self.pc += 1
-            result_info = {"op": f"SUB {val_a}-{val_b}={result}", "stack": self._read_stack()}
-
-        elif opcode == MUL:
-            val_b = self._stack_read(self.sp - 1)
-            val_a = self._stack_read(self.sp - 2)
-            # MUL can't be a single linear layer — it needs the FFN's
-            # nonlinearity. In practice: decompose into repeated addition
-            # or use the quadratic identity: a*b = ((a+b)^2 - (a-b)^2) / 4
-            # which CAN be computed with ReLU: x^2 ≈ via piecewise linear approx
-            # For this demo, we use exact multiplication (the FFN weights
-            # would implement the quadratic identity with sufficient hidden neurons)
-            result = val_a * val_b
-            self.sp -= 2
-            self._stack_write(self.sp, result)
-            self.sp += 1
-            self.pc += 1
-            result_info = {"op": f"MUL {val_a}*{val_b}={result}", "stack": self._read_stack()}
-
-        elif opcode == DUP:
-            val = self._stack_read(self.sp - 1)
-            self._stack_write(self.sp, val)
-            self.sp += 1
-            self.pc += 1
-            result_info = {"op": f"DUP {val}", "stack": self._read_stack()}
-
-        elif opcode == NEG:
-            val = self._stack_read(self.sp - 1)
-            # FFN: W_neg = [-1]
-            result = -val
-            self._stack_write(self.sp - 1, result)
-            self.pc += 1
-            result_info = {"op": f"NEG {val}→{result}", "stack": self._read_stack()}
+        elif activations[ADD] > 0.5:
+            result_info = {"op": f"ADD {val_a}+{val_b}={write_val}", "stack": self._read_stack()}
+        elif activations[SUB] > 0.5:
+            result_info = {"op": f"SUB {val_a}-{val_b}={write_val}", "stack": self._read_stack()}
+        elif activations[MUL] > 0.5:
+            result_info = {"op": f"MUL {val_a}*{val_b}={write_val}", "stack": self._read_stack()}
+        elif activations[DUP] > 0.5:
+            result_info = {"op": f"DUP {val_b}", "stack": self._read_stack()}
+        elif activations[NEG] > 0.5:
+            result_info = {"op": f"NEG {val_b}→{write_val}", "stack": self._read_stack()}
 
         # ======================================
         # OUTPUT: Emit token + update KV cache
@@ -518,29 +608,69 @@ class TransformerComputer:
     # Memory operations (via attention)
     # ----------------------------------------------------------
 
+    # ----------------------------------------------------------
+    # State update via rotation matrices (FFN Layer 5)
+    # ----------------------------------------------------------
+
+    def _advance_pc(self):
+        """Increment PC by 1 via 2D rotation matrix (NOT integer +1)."""
+        self.pc_vec = R_PC @ self.pc_vec
+        self.pc += 1  # keep integer in sync for stack indexing / trace
+
+    def _advance_sp(self, delta):
+        """
+        Update SP by delta via repeated 2D rotation (NOT integer +=).
+        delta > 0 = increment, delta < 0 = decrement.
+        """
+        if delta > 0:
+            for _ in range(delta):
+                self.sp_vec = R_SP_INC @ self.sp_vec
+        elif delta < 0:
+            for _ in range(-delta):
+                self.sp_vec = R_SP_DEC @ self.sp_vec
+        self.sp += delta  # keep integer in sync for stack indexing / trace
+
+    # ----------------------------------------------------------
+    # Memory operations (via attention)
+    # ----------------------------------------------------------
+
     def _stack_write(self, pos, value):
         """
-        Write a value to stack position pos.
+        Write a value to stack position pos via KV cache insertion.
 
-        In the real transformer: emit a token whose key (on the stack head)
-        encodes this position with a scaled magnitude so the latest write
-        wins in argmax attention.
+        The key direction encodes the stack position (angle-based).
+        The key magnitude increases monotonically (_write_counter) so
+        the latest write to a given position always has the largest
+        dot product with the query direction → wins the argmax.
 
-        Here we use a dict for efficiency — conceptually identical to
-        attention with perfect key matching, since the latest write for
-        a given position always has the largest key magnitude and thus
-        always wins the argmax.
+        This is how the paper handles memory overwrites: newer tokens
+        have larger-magnitude keys in the same direction, so argmax
+        attention always retrieves the latest value.
         """
-        self._stack_mem[pos] = value
+        self._write_counter += 1
+        # Key = direction of stack position * increasing magnitude
+        # The scale factor (0.0001) must be small enough that magnitude
+        # growth never overpowers the angular separation between adjacent
+        # stack positions: scale << (1 - cos(2*pi/MAX_STACKD)) ≈ 0.0003
+        direction = make_stack_key(pos)
+        scaled_key = direction * (1.0 + self._write_counter * 0.0001)
+        # Insert into stack cache on heads 1 and 2 (both can read stack)
+        keys = {HEAD_STACK0: scaled_key, HEAD_STACK1: scaled_key}
+        vals = {HEAD_STACK0: value, HEAD_STACK1: value}
+        self.stack_cache.insert(keys, vals)
 
     def _stack_read(self, pos):
         """
-        Read a value from stack position pos.
+        Read a value from stack position pos via 2D argmax attention.
 
-        In the real transformer: 2D argmax attention query matching
-        the key direction for this stack position.
+        Query direction matches the key direction for this position.
+        The token with the largest dot product (= latest write) wins.
         """
-        return self._stack_mem.get(pos, 0)
+        query = make_stack_query(pos)
+        result = self.stack_cache.query(HEAD_STACK0, query)
+        if result is None:
+            return 0
+        return result
 
     def _read_stack(self):
         """Read full stack (for trace output only)."""
