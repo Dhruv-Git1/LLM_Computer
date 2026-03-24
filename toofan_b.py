@@ -21,6 +21,56 @@ from toofan_a import (
     OP_NAME,
 )
 
+
+# ================================================================
+# MATRIX KV CACHE — Pure matrix operations, no Python control flow
+# ================================================================
+class MatrixKVCache:
+    """
+    KV cache that uses pre-allocated numpy matrices for keys.
+
+    Query operation is pure matrix ops:
+      scores = keys_matrix @ query_vector    (matrix multiply)
+      best   = np.argmax(scores)             (argmax attention)
+      value  = values_array[best]            (numpy indexing)
+
+    No Python conditionals (if/elif) in query().
+    No list-to-array conversion on each query.
+    """
+
+    def __init__(self, n_heads, key_dim=2, max_tokens=4096):
+        self.n_heads = n_heads
+        self.max_tokens = max_tokens
+        # Pre-allocated key matrices: one (max_tokens, key_dim) array per head
+        self._keys = {h: np.zeros((max_tokens, key_dim), dtype=np.float64)
+                      for h in range(n_heads)}
+        # Values stored as numpy object arrays (supports both scalars and tuples)
+        self._values = {h: np.empty(max_tokens, dtype=object)
+                        for h in range(n_heads)}
+        self._counts = np.zeros(n_heads, dtype=np.int64)
+
+    def insert(self, keys_per_head, values_per_head):
+        """Insert key-value pairs. This is the memory write bus."""
+        for h, k in keys_per_head.items():
+            idx = int(self._counts[h])
+            self._keys[h][idx] = np.asarray(k, dtype=np.float64)
+            self._values[h][idx] = values_per_head[h]
+            self._counts[h] += 1
+
+    def query(self, head_id, query_2d):
+        """
+        Pure matrix attention query. NO Python conditionals.
+
+        Requires cache to be pre-seeded (at least one entry per head).
+        """
+        n = int(self._counts[head_id])
+        # MATRIX MULTIPLY: compute attention scores for all keys
+        scores = self._keys[head_id][:n] @ query_2d    # (n,) scores
+        # ARGMAX: find best-matching key
+        best_idx = np.argmax(scores)                     # scalar index
+        # VALUE RETRIEVAL: numpy array indexing
+        return self._values[head_id][best_idx]
+
 # ================================================================
 # CONSTANTS
 # ================================================================
@@ -33,6 +83,18 @@ MAX_STACKD = 32       # stack depth (wide angular separation)
 OPCODE_LIST = [CONST, ADD, SUB, MUL, HALT, DUP, NEG, JMP, JZ]
 OPCODE_TO_ACT_DIM = {op: 6 + i for i, op in enumerate(OPCODE_LIST)}
 
+# Pre-computed opcode indices in OPCODE_LIST (for use in forward_pass without .index())
+# OPCODE_LIST = [CONST, ADD, SUB, MUL, HALT, DUP, NEG, JMP, JZ]
+CONST_ACT_IDX = 0
+ADD_ACT_IDX = 1
+SUB_ACT_IDX = 2
+MUL_ACT_IDX = 3
+HALT_ACT_IDX = 4
+DUP_ACT_IDX = 5
+NEG_ACT_IDX = 6
+JMP_ACT_IDX = 7
+JZ_ACT_IDX = 8
+
 # ================================================================
 # WRITE_FLAG SELECTOR MATRIX (pure matrix operation)
 # ================================================================
@@ -44,17 +106,6 @@ WRITE_FLAG_SELECTOR = np.zeros(9, dtype=np.float64)
 for op in WRITING_OPCODES:
     idx = OPCODE_LIST.index(op)
     WRITE_FLAG_SELECTOR[idx] = 1.0
-
-# ================================================================
-# PERSISTENCE MASK (for state clearing without Python assignment)
-# ================================================================
-# Persistent dims: PC_DIR, SP_DIR, CYCLE_CTR (carried forward)
-# Temporary dims: everything else (cleared each cycle)
-PERSISTENCE_MASK = np.zeros(D_MODEL, dtype=np.float64)
-PERSISTENCE_MASK[PC_DIR] = 1.0       # PC persists
-PERSISTENCE_MASK[SP_DIR] = 1.0       # SP persists
-PERSISTENCE_MASK[CYCLE_CTR] = 1.0    # Cycle counter persists
-# All other dims = 0.0 (will be zeroed)
 
 # ================================================================
 # RESIDUAL STREAM DIMENSION MAP
@@ -83,6 +134,16 @@ def act_idx(op):
     return 6 + OPCODE_LIST.index(op)
 
 # ================================================================
+# PERSISTENCE MASK (for state clearing without Python assignment)
+# ================================================================
+# Persistent dims: PC_DIR, SP_DIR, CYCLE_CTR (carried forward)
+# Temporary dims: everything else (cleared each cycle)
+PERSISTENCE_MASK = np.zeros(D_MODEL, dtype=np.float64)
+PERSISTENCE_MASK[PC_DIR] = 1.0       # PC persists
+PERSISTENCE_MASK[SP_DIR] = 1.0       # SP persists
+PERSISTENCE_MASK[CYCLE_CTR] = 1.0    # Cycle counter persists
+
+# ================================================================
 # ROTATION MATRICES (precomputed, fixed weights)
 # ================================================================
 _dtheta_pc = 2.0 * np.pi / MAX_ADDRS
@@ -96,19 +157,6 @@ R_SP_DEC = R_SP_INC.T  # inverse rotation
 
 # Double reverse rotation for sp-2
 R_SP_DEC2 = R_SP_DEC @ R_SP_DEC
-
-# ================================================================
-# FFN WEIGHT MATRICES (hand-crafted, not trained)
-# ================================================================
-W_ADD = np.array([1.0, 1.0], dtype=np.float64)
-W_SUB = np.array([1.0, -1.0], dtype=np.float64)
-W_NEG = np.array([-1.0], dtype=np.float64)
-
-# MUL pre-processing: [a+b, a-b] = W_MUL_PRE @ [a, b]
-W_MUL_PRE = np.array([[1.0, 1.0], [1.0, -1.0]], dtype=np.float64)
-# MUL post-processing: result = W_MUL_POST @ [s^2, d^2]
-W_MUL_POST = np.array([0.25, -0.25], dtype=np.float64)
-
 
 # ================================================================
 # LAYER 2: Opcode Decode — Build W1, b1, W2, b2
@@ -177,71 +225,209 @@ def _build_layer2_weights():
 
 
 # ================================================================
-# LAYER 4: ALU — Build W1, b1, W2, b2
+# LAYER 4: ALU — GLU-style FFN (ReGLU)
 # ================================================================
 # All arithmetic happens in parallel, gated by opcode activations.
-# Uses the "bilinear trick": for binary gate g and value v,
-#   g * v ≈ (ReLU(S*g + v) - ReLU(S*g - v)) / 2   for large S
-# When g=0: (ReLU(v) - ReLU(-v))/2 = v/2 - (-v/2)... wait, that gives v.
-# Actually: when g=0: (ReLU(0+v) - ReLU(0-v))/2 = (ReLU(v) - ReLU(-v))/2
-#   = (max(0,v) - max(0,-v))/2 = v/2 when v>0, -(-v)/2 = v/2 when v<0... = |v|/2 sign issues
+# Architecture:
+#   gate   = ReLU(W1a @ x + b1a)           (gate path with ReLU)
+#   value  = W1b @ x + b1b                  (value path, linear)
+#   hidden = gate * value                    (element-wise product, GLU)
+#   hidden[mul_idx] *= hidden[mul_idx]       (Hadamard squaring for MUL)
+#   output = W2 @ hidden + b2               (output projection)
 #
-# Better approach for binary gate g ∈ {0,1} and value v:
-# Use a large scale S and threshold:
-#   h1 = ReLU(S*g + v - S/2)    -- fires only when g=1 (then = v + S/2)
-#   h2 = ReLU(S*g - v - S/2)    -- fires only when g=1 (then = -v + S/2)
-#   gated = (h1 - h2) / 2        -- when g=1: ((v+S/2) - (-v+S/2))/2 = v
-#                                    when g=0: both h1,h2 = 0 (since |v| < S/2)
-# This works perfectly for |v| < S/2. Use S = 1e6.
+# This is a ReGLU (ReLU-Gated Linear Unit), standard in modern
+# transformer architectures (LLaMA uses SwiGLU, a close variant).
 
-S_GATE = 1e6  # gating scale factor (must be >> max operand value)
-
-def _build_layer4_weights():
+def _build_layer4_glu_weights():
     """
-    Build FFN weights for ALU layer.
+    Build GLU-style FFN weights for the ALU layer.
 
-    Key insight: zero_flag and write_flag are computed via ReLU and matrix sums,
-    NOT via Python min() or sum() loops.
+    Hidden layer (11 units):
+      h0:  act_CONST * arg           → ALU_RESULT
+      h1:  act_ADD * (a+b)           → ALU_RESULT
+      h2:  act_SUB * (a-b)           → ALU_RESULT
+      h3:  act_MUL * (a+b) → sq     → ALU_RESULT (* 0.25)
+      h4:  act_MUL * (a-b) → sq     → ALU_RESULT (* -0.25)
+      h5:  act_DUP * val_b           → ALU_RESULT
+      h6:  act_NEG * (-val_b)        → ALU_RESULT
+      h7:  ReLU(val_b) * 1           → ZERO_FLAG  (-1/eps)
+      h8:  ReLU(-val_b) * 1          → ZERO_FLAG  (-1/eps)
+      h9:  1 * act_HALT              → HALT_FLAG
+      h10: 1 * (writing acts sum)    → WRITE_FLAG
+
+    MUL uses a*b = ((a+b)^2 - (a-b)^2)/4.
+    Squaring: (act_MUL*(a+b))^2 = act_MUL*(a+b)^2 since act_MUL ∈ {0,1}.
     """
-    # Layer 4 is simple: it mostly just computes zero_flag and write_flag.
-    # Both can be done with ReLU and matrix operations.
+    # 7 ALU ops + 2 zero_flag + 1 halt + 6 write_flag = 16
+    d_hidden = 16
+    mul_indices = np.array([3, 4])
+    eps_zf = 1e-9
 
-    # Hidden neurons:
-    # 0-1: positive and negative components of val_b (for zero_flag)
-    # 2-10: one per writing opcode (for write_flag sum)
-    n_hidden = 11
-    W1 = np.zeros((n_hidden, D_MODEL), dtype=np.float64)
-    b1 = np.zeros(n_hidden, dtype=np.float64)
-    W2 = np.zeros((D_MODEL, n_hidden), dtype=np.float64)
+    W1a = np.zeros((d_hidden, D_MODEL), dtype=np.float64)
+    b1a = np.zeros(d_hidden, dtype=np.float64)
+    W1b = np.zeros((d_hidden, D_MODEL), dtype=np.float64)
+    b1b = np.zeros(d_hidden, dtype=np.float64)
+    W2 = np.zeros((D_MODEL, d_hidden), dtype=np.float64)
     b2 = np.zeros(D_MODEL, dtype=np.float64)
 
-    # Hidden 0-1: Compute |val_b| via ReLU decomposition
-    W1[0, VAL_B] = 1.0  # h0 = ReLU(val_b)
-    W1[1, VAL_B] = -1.0  # h1 = ReLU(-val_b)
+    # h0: CONST — gate=act_CONST, value=arg
+    W1a[0, 6 + CONST_ACT_IDX] = 1.0
+    W1b[0, ARG_FLOAT] = 1.0
+    W2[ALU_RESULT, 0] = 1.0
 
-    # Hidden 2-10: Copy writing opcode activations
-    writing_opcodes = [CONST, ADD, SUB, MUL, DUP, NEG]
-    for i, op in enumerate(writing_opcodes):
-        op_dim = act_idx(op)
-        W1[2 + i, op_dim] = 1.0  # Just copy the activation
+    # h1: ADD — gate=act_ADD, value=val_a+val_b
+    W1a[1, 6 + ADD_ACT_IDX] = 1.0
+    W1b[1, VAL_A] = 1.0
+    W1b[1, VAL_B] = 1.0
+    W2[ALU_RESULT, 1] = 1.0
 
-    # W2 outputs:
-    # - ZERO_FLAG: ReLU clamped based on |val_b| < eps
-    #   After h0 + h1 = |val_b|, we clamp to [0, 1]
-    eps_zf = 1e-9
-    W2[ZERO_FLAG, 0] = 1.0 / eps_zf  # pos component
-    W2[ZERO_FLAG, 1] = 1.0 / eps_zf  # neg component
-    b2[ZERO_FLAG] = -1.0  # ReLU(1/eps * (h0 + h1) - 1) ≈ 1 when h0+h1 < eps
+    # h2: SUB — gate=act_SUB, value=val_a-val_b
+    W1a[2, 6 + SUB_ACT_IDX] = 1.0
+    W1b[2, VAL_A] = 1.0
+    W1b[2, VAL_B] = -1.0
+    W2[ALU_RESULT, 2] = 1.0
 
-    # - WRITE_FLAG: sum of writing opcode activations (dims 2-7)
-    for i in range(len(writing_opcodes)):
-        W2[WRITE_FLAG, 2 + i] = 1.0  # sum them
+    # h3: MUL (a+b) — gate=act_MUL, value=a+b (squared post-hoc)
+    # After GLU: act_MUL*(a+b). After squaring: act_MUL^2*(a+b)^2 = act_MUL*(a+b)^2
+    W1a[3, 6 + MUL_ACT_IDX] = 1.0
+    W1b[3, VAL_A] = 1.0
+    W1b[3, VAL_B] = 1.0
+    W2[ALU_RESULT, 3] = 0.25    # 0.25 * (a+b)^2
 
-    # - ALU_RESULT: unchanged (computed in forward_pass)
-    # - HALT_FLAG: unchanged
-    # - All others: zero (computed elsewhere or in forward_pass)
+    # h4: MUL (a-b) — gate=act_MUL, value=a-b (squared post-hoc)
+    W1a[4, 6 + MUL_ACT_IDX] = 1.0
+    W1b[4, VAL_A] = 1.0
+    W1b[4, VAL_B] = -1.0
+    W2[ALU_RESULT, 4] = -0.25   # -0.25 * (a-b)^2
 
-    return W1, b1, W2, b2
+    # h5: DUP — gate=act_DUP, value=val_b
+    W1a[5, 6 + DUP_ACT_IDX] = 1.0
+    W1b[5, VAL_B] = 1.0
+    W2[ALU_RESULT, 5] = 1.0
+
+    # h6: NEG — gate=act_NEG, value=-val_b
+    W1a[6, 6 + NEG_ACT_IDX] = 1.0
+    W1b[6, VAL_B] = -1.0
+    W2[ALU_RESULT, 6] = 1.0
+
+    # h7: zero_flag positive — gate=ReLU(val_b), value=1.0
+    W1a[7, VAL_B] = 1.0
+    b1b[7] = 1.0
+    W2[ZERO_FLAG, 7] = -1.0 / eps_zf
+
+    # h8: zero_flag negative — gate=ReLU(-val_b), value=1.0
+    W1a[8, VAL_B] = -1.0
+    b1b[8] = 1.0
+    W2[ZERO_FLAG, 8] = -1.0 / eps_zf
+    b2[ZERO_FLAG] = 1.0   # zero_flag = 1 - |val_b|/eps
+
+    # h9: halt_flag — gate=ReLU(act_HALT), value=1.0
+    W1a[9, 6 + HALT_ACT_IDX] = 1.0
+    b1b[9] = 1.0
+    W2[HALT_FLAG, 9] = 1.0
+
+    # h10-h15: write_flag — one hidden unit per writing opcode
+    # (Can't sum activations in one gate because tent function makes
+    # non-active opcodes negative. Each needs separate ReLU gate.)
+    for i, op_idx in enumerate([CONST_ACT_IDX, ADD_ACT_IDX, SUB_ACT_IDX,
+                                MUL_ACT_IDX, DUP_ACT_IDX, NEG_ACT_IDX]):
+        h = 10 + i
+        W1a[h, 6 + op_idx] = 1.0    # gate = ReLU(act_OP)
+        b1b[h] = 1.0                  # value = 1.0
+        W2[WRITE_FLAG, h] = 1.0       # sum into write_flag
+
+    return W1a, b1a, W1b, b1b, W2, b2, mul_indices
+
+
+# ================================================================
+# LAYER 5: Branch Resolution — GLU-style FFN (ReGLU)
+# ================================================================
+# Computes PC and SP updates via gated blends using pre-built weight
+# matrices. Uses residual connection: output encodes DELTAS.
+
+def _build_layer5_glu_weights():
+    """
+    Build GLU-style FFN weights for Branch Resolution.
+
+    Tent function produces negative values for non-active opcodes,
+    so each opcode gets its own hidden unit (can't sum activations).
+
+    Hidden layer (18 units):
+      h0-h1:   act_JMP * delta_pc per component
+      h2-h3:   AND(act_JZ, zero_flag) * delta_pc per component
+      h4-h11:  SP decrement: 4 opcodes × 2 components (ADD, SUB, MUL, JZ)
+      h12-h15: SP increment: 2 opcodes × 2 components (CONST, DUP)
+      h16-h17: PC pass-through (baseline advance)
+    """
+    d_hidden = 18
+
+    W1a = np.zeros((d_hidden, D_MODEL), dtype=np.float64)
+    b1a = np.zeros(d_hidden, dtype=np.float64)
+    W1b = np.zeros((d_hidden, D_MODEL), dtype=np.float64)
+    b1b = np.zeros(d_hidden, dtype=np.float64)
+    W2 = np.zeros((D_MODEL, d_hidden), dtype=np.float64)
+    b2 = np.zeros(D_MODEL, dtype=np.float64)
+
+    # --- PC update ---
+    for k in range(2):
+        # h0,h1: JMP gating
+        h_jmp = k
+        W1a[h_jmp, 6 + JMP_ACT_IDX] = 1.0
+        W1b[h_jmp, 18 + k] = 1.0
+        W1b[h_jmp, 0] = -R_PC[k, 0]
+        W1b[h_jmp, 1] = -R_PC[k, 1]
+        W2[k, h_jmp] = 1.0
+        W2[21 + k, h_jmp] = 1.0
+
+        # h2,h3: JZ AND gate
+        h_jz = 2 + k
+        W1a[h_jz, 6 + JZ_ACT_IDX] = 1.0
+        W1a[h_jz, ZERO_FLAG] = 1.0
+        b1a[h_jz] = -1.5
+        W1b[h_jz, 18 + k] = 1.0
+        W1b[h_jz, 0] = -R_PC[k, 0]
+        W1b[h_jz, 1] = -R_PC[k, 1]
+        W2[k, h_jz] = 2.0
+        W2[21 + k, h_jz] = 2.0
+
+    # --- SP decrement: one hidden unit per opcode per component ---
+    # Opcodes that decrement SP: ADD, SUB, MUL, JZ
+    dec_opcodes = [ADD_ACT_IDX, SUB_ACT_IDX, MUL_ACT_IDX, JZ_ACT_IDX]
+    for i, op_idx in enumerate(dec_opcodes):
+        for k in range(2):
+            h = 4 + i * 2 + k
+            W1a[h, 6 + op_idx] = 1.0             # gate = ReLU(act_OP)
+            W1b[h, 2] = R_SP_DEC[k, 0] - (1.0 if k == 0 else 0.0)
+            W1b[h, 3] = R_SP_DEC[k, 1] - (1.0 if k == 1 else 0.0)
+            W2[2 + k, h] = 1.0                    # → SP_DIR[k]
+            W2[23 + k, h] = 1.0                   # → NEW_SP[k]
+
+    # --- SP increment: one hidden unit per opcode per component ---
+    # Opcodes that increment SP: CONST, DUP
+    inc_opcodes = [CONST_ACT_IDX, DUP_ACT_IDX]
+    for i, op_idx in enumerate(inc_opcodes):
+        for k in range(2):
+            h = 12 + i * 2 + k
+            W1a[h, 6 + op_idx] = 1.0
+            W1b[h, 2] = R_SP_INC[k, 0] - (1.0 if k == 0 else 0.0)
+            W1b[h, 3] = R_SP_INC[k, 1] - (1.0 if k == 1 else 0.0)
+            W2[2 + k, h] = 1.0
+            W2[23 + k, h] = 1.0
+
+    # --- PC pass-through (baseline advance) ---
+    for k in range(2):
+        h_pt = 16 + k
+        b1a[h_pt] = 1.0                          # constant gate = 1.0
+        W1b[h_pt, k] = 1.0                       # pc_dir[k]
+        W2[0, h_pt] = R_PC[0, k] - (1.0 if k == 0 else 0.0)
+        W2[1, h_pt] = R_PC[1, k] - (1.0 if k == 1 else 0.0)
+        W2[21, h_pt] = R_PC[0, k] - (1.0 if k == 0 else 0.0)
+        W2[22, h_pt] = R_PC[1, k] - (1.0 if k == 1 else 0.0)
+
+    # Cycle counter: constant +1 via bias
+    b2[CYCLE_CTR] = 1.0
+
+    return W1a, b1a, W1b, b1b, W2, b2
 
 
 # ================================================================
@@ -264,30 +450,39 @@ class RealTransformerComputer:
 
     def __init__(self):
         # Build fixed weight matrices (these are the "hand-crafted weights")
+        # Layer 2: Standard FFN (tent function opcode decode)
         self.W1_L2, self.b1_L2, self.W2_L2, self.b2_L2 = _build_layer2_weights()
-        # Note: Layer 4 flags (zero_flag, write_flag) are computed inline in forward_pass()
-        # without weight matrices, using numpy operations (not Python functions)
+
+        # Layer 4: GLU FFN (ALU arithmetic + flags)
+        (self.W1a_L4, self.b1a_L4, self.W1b_L4, self.b1b_L4,
+         self.W2_L4, self.b2_L4, self.mul_indices) = _build_layer4_glu_weights()
+
+        # Layer 5: GLU FFN (branch resolution + state update)
+        (self.W1a_L5, self.b1a_L5, self.W1b_L5, self.b1b_L5,
+         self.W2_L5, self.b2_L5) = _build_layer5_glu_weights()
 
         # Layer 1: W_Q extracts pc_dir (identity on dims 0-1)
         self.W_Q_L1 = np.zeros((2, D_MODEL), dtype=np.float64)
         self.W_Q_L1[0:2, 0:2] = np.eye(2)
 
         # Layer 1: W_O projects 4 fetched values to dims 4, 5, 18, 19
-        # This matrix takes [opcode, arg, tgt_cos, tgt_sin] and writes to residual stream
         self.W_O_L1 = np.zeros((D_MODEL, 4), dtype=np.float64)
         self.W_O_L1[OPCODE_RAW, 0] = 1.0     # opcode → dim 4
         self.W_O_L1[ARG_FLOAT, 1] = 1.0      # arg → dim 5
         self.W_O_L1[18, 2] = 1.0             # tgt_cos → dim 18
         self.W_O_L1[19, 3] = 1.0             # tgt_sin → dim 19
 
-        # Layer 3: W_Q for stack reads: extract sp_dir and apply rotation
-        # Head 1 (top): R_SP_DEC @ sp_dir
+        # Layer 3: W_Q for stack reads
         self.W_Q_head1 = np.zeros((2, D_MODEL), dtype=np.float64)
-        self.W_Q_head1[0:2, 2:4] = R_SP_DEC   # extract dims 2-3, apply R_SP_DEC
+        self.W_Q_head1[0:2, 2:4] = R_SP_DEC
 
-        # Head 2 (second): R_SP_DEC^2 @ sp_dir
         self.W_Q_head2 = np.zeros((2, D_MODEL), dtype=np.float64)
-        self.W_Q_head2[0:2, 2:4] = R_SP_DEC2  # extract dims 2-3, apply R_SP_DEC^2
+        self.W_Q_head2[0:2, 2:4] = R_SP_DEC2
+
+        # Layer 3: W_O projects [va, vb] into residual stream
+        self.W_O_L3 = np.zeros((D_MODEL, 2), dtype=np.float64)
+        self.W_O_L3[VAL_A, 0] = 1.0          # va → dim 15
+        self.W_O_L3[VAL_B, 1] = 1.0          # vb → dim 16
 
         self.reset()
 
@@ -297,8 +492,8 @@ class RealTransformerComputer:
         self.residual_stream[PC_DIR] = addr_to_2d(0, MAX_ADDRS)
         self.residual_stream[SP_DIR] = make_stack_key(0)
 
-        self.instr_cache = NaiveKVCache(n_heads=1)
-        self.stack_cache = NaiveKVCache(n_heads=3)
+        self.instr_cache = MatrixKVCache(n_heads=1)
+        self.stack_cache = MatrixKVCache(n_heads=3)
 
         # Pre-seed stack cache with default 0.0 at a far location to eliminate None returns
         # This is like initializing stack memory to zeros
@@ -378,153 +573,57 @@ class RealTransformerComputer:
         # Head 1: query = R_SP_DEC @ sp_dir → stack top (val_b)
         q_top = self.W_Q_head1 @ x   # shape (2,)
         vb = self.stack_cache.query(1, q_top)
-        # No Python ternary: stack cache is pre-seeded in reset(), so vb is never None
 
         # Head 2: query = R_SP_DEC^2 @ sp_dir → stack second (val_a)
         q_sec = self.W_Q_head2 @ x   # shape (2,)
         va = self.stack_cache.query(2, q_sec)
-        # No Python ternary: stack cache is pre-seeded, so va is never None
 
-        attn3 = np.zeros(D_MODEL, dtype=np.float64)
-        attn3[VAL_A] = va
-        attn3[VAL_B] = vb
+        # W_O: project [va, vb] into residual stream via matrix multiply
+        fetched_stack = np.array([va, vb], dtype=np.float64)
+        attn3 = self.W_O_L3 @ fetched_stack  # shape (28,)
         x = x + attn3  # residual connection
 
         # ==========================================
-        # LAYER 4: ALU + Flags (FFN)
+        # LAYER 4: ALU + Flags (GLU FFN)
         # ==========================================
-        # All arithmetic pathways computed in parallel.
-        # Each gated by its opcode activation.
-        # NO if/elif — all gating via continuous multiplication.
-
-        val_a = x[VAL_A]
-        val_b = x[VAL_B]
-        arg = x[ARG_FLOAT]
-        operands = np.array([val_a, val_b], dtype=np.float64)
-
-        # Raw arithmetic results (computed unconditionally)
-        add_raw = float(W_ADD @ operands)                # a + b
-        sub_raw = float(W_SUB @ operands)                # a - b
-        # MUL via quadratic identity with ReLU squaring
-        sd = W_MUL_PRE @ operands                        # [a+b, a-b]
-        s_sq = np.maximum(0, sd[0])**2 + np.maximum(0, -sd[0])**2
-        d_sq = np.maximum(0, sd[1])**2 + np.maximum(0, -sd[1])**2
-        mul_raw = float(W_MUL_POST @ np.array([s_sq, d_sq]))
-        neg_raw = float(W_NEG @ np.array([val_b]))       # -b
-        const_raw = arg                                    # arg
-        dup_raw = val_b                                    # b
-
-        # Gated sum: alu_result = sum(activation_i * result_i)
-        # This is the CORRECT pattern — no if/elif needed.
-        acts = np.maximum(0, x[ACT])  # ReLU clamp — zero out negative activations
-        results = np.array([
-            const_raw,   # CONST (act idx 0)
-            add_raw,     # ADD   (act idx 1)
-            sub_raw,     # SUB   (act idx 2)
-            mul_raw,     # MUL   (act idx 3)
-            0.0,         # HALT  (act idx 4) — no arithmetic
-            dup_raw,     # DUP   (act idx 5)
-            neg_raw,     # NEG   (act idx 6)
-            0.0,         # JMP   (act idx 7) — no arithmetic
-            0.0,         # JZ    (act idx 8) — no arithmetic
-        ], dtype=np.float64)
-
-        alu_result = float(np.dot(acts, results))
-
-        # ===== ZERO_FLAG and WRITE_FLAG - FIXED: NO Python min() or sum() =====
-
-        # zero_flag: 1.0 if |val_b| < eps, else 0.0
-        # Previously used: min(zero_flag_raw / eps_zf, 1.0)
-        # Now using: np.minimum() which is a numpy function, not Python built-in
-        eps_zf = 1e-9
-        abs_vb = np.maximum(0, val_b) + np.maximum(0, -val_b)  # = |val_b| via ReLU
-        zero_flag_raw = np.maximum(0, eps_zf - abs_vb)  # > 0 only when |val_b| < eps
-        zero_flag = np.minimum(zero_flag_raw / eps_zf, 1.0)     # numpy minimum, not Python min()
-
-        # write_flag: sum of activations for writing opcodes
-        # Previously used: sum(acts[OPCODE_LIST.index(op)] for op in writing_opcodes)
-        # Now using: np.sum() which is a numpy function, not Python sum()
-        writing_opcodes = [CONST, ADD, SUB, MUL, DUP, NEG]
-        # MATRIX OPERATION: pure dot product (no Python loop)
-        write_flag = WRITE_FLAG_SELECTOR @ acts  # Pure matrix multiplication
-
-        # halt_flag: activation of HALT opcode
-        halt_flag = acts[OPCODE_LIST.index(HALT)]
-
-        # Write FFN output to residual stream
-        ffn4 = np.zeros(D_MODEL, dtype=np.float64)
-        ffn4[ALU_RESULT] = alu_result
-        ffn4[ZERO_FLAG] = zero_flag
-        ffn4[HALT_FLAG] = halt_flag
-        ffn4[WRITE_FLAG] = write_flag
-        x = x + ffn4
+        # ReGLU architecture: gate * value with Hadamard squaring for MUL.
+        # ALL arithmetic is encoded in pre-built weight matrices.
+        gate4 = np.maximum(0, self.W1a_L4 @ x + self.b1a_L4)    # ReLU gate
+        value4 = self.W1b_L4 @ x + self.b1b_L4                    # linear value
+        hidden4 = gate4 * value4                                    # element-wise product (GLU)
+        # Hadamard squaring for MUL: (act_MUL*(a+b))^2 = act_MUL*(a+b)^2
+        hidden4[self.mul_indices] = hidden4[self.mul_indices] * hidden4[self.mul_indices]
+        ffn4 = self.W2_L4 @ hidden4 + self.b2_L4                  # output projection
+        x = x + ffn4                                                # residual connection
 
         # ==========================================
-        # LAYER 5: Branch Resolution + State Update
+        # LAYER 5: Branch Resolution + State Update (GLU FFN)
         # ==========================================
-        # Compute new PC direction with NO if/elif.
-        #
-        # jump_signal = act[JMP] + act[JZ] * zero_flag
-        # The AND gate for binary inputs: a*b = 2*ReLU(a + b - 1.5)
-        act_jmp = acts[OPCODE_LIST.index(JMP)]
-        act_jz = acts[OPCODE_LIST.index(JZ)]
-        jz_and_zero = 2.0 * np.maximum(0, act_jz + x[ZERO_FLAG] - 1.5)
-        jump_signal = act_jmp + jz_and_zero
-        stay_signal = np.maximum(0, 1.0 - jump_signal)  # ReLU(1 - jump)
+        # Save pre-Layer5 state for memory write bus
+        acts = np.maximum(0, x[ACT])          # activations (unchanged by L4/L5)
+        sp_dir_pre = x[SP_DIR].copy()         # SP before update
 
-        # PC advance (sequential): R_PC @ pc_dir
-        pc_advance = R_PC @ x[PC_DIR]
+        # GLU FFN: all PC/SP updates via pre-built weight matrices
+        # W2 encodes (R_PC - I) for baseline advance, jump gating,
+        # SP rotation deltas, and cycle counter increment.
+        gate5 = np.maximum(0, self.W1a_L5 @ x + self.b1a_L5)    # ReLU gate
+        value5 = self.W1b_L5 @ x + self.b1b_L5                    # linear value
+        hidden5 = gate5 * value5                                    # element-wise product (GLU)
+        ffn5 = self.W2_L5 @ hidden5 + self.b2_L5                  # output projection
+        x = x + ffn5                                                # residual connection
 
-        # Gated blend: new_pc = jump * jmp_target + stay * pc_advance
-        # For binary jump_signal, this is exact:
-        new_pc = jump_signal * x[JMP_TGT] + stay_signal * pc_advance
-
-        # SP update: gated rotation based on which opcode-group is active
-        # Net -1: ADD, SUB, MUL, JZ (pop 2 push 1, or pop 1 push 0)
-        gate_dec1 = (acts[OPCODE_LIST.index(ADD)] +
-                     acts[OPCODE_LIST.index(SUB)] +
-                     acts[OPCODE_LIST.index(MUL)] +
-                     acts[OPCODE_LIST.index(JZ)])
-        # Net 0: HALT, NEG, JMP
-        gate_same = (acts[OPCODE_LIST.index(HALT)] +
-                     acts[OPCODE_LIST.index(NEG)] +
-                     acts[OPCODE_LIST.index(JMP)])
-        # Net +1: CONST, DUP
-        gate_inc1 = (acts[OPCODE_LIST.index(CONST)] +
-                     acts[OPCODE_LIST.index(DUP)])
-
-        sp_dir = x[SP_DIR]
-        sp_dec1 = R_SP_DEC @ sp_dir
-        sp_inc1 = R_SP_INC @ sp_dir
-        new_sp = gate_dec1 * sp_dec1 + gate_same * sp_dir + gate_inc1 * sp_inc1
-
-        # Compute stack write position direction
-        # CONST/DUP: write at current SP (before increment) = sp_dir
-        # ADD/SUB/MUL: write at SP-2 (after pop) = R_SP_DEC^2 @ sp_dir
-        # NEG: write at SP-1 (overwrite top) = R_SP_DEC @ sp_dir
-        # Others (HALT/JMP/JZ): no write, but write_flag=0 so it doesn't matter
-        sp_dec2 = R_SP_DEC2 @ sp_dir
-        gate_write_at_sp = (acts[OPCODE_LIST.index(CONST)] +
-                            acts[OPCODE_LIST.index(DUP)])
-        gate_write_at_sp2 = (acts[OPCODE_LIST.index(ADD)] +
-                             acts[OPCODE_LIST.index(SUB)] +
-                             acts[OPCODE_LIST.index(MUL)])
-        gate_write_at_sp1 = acts[OPCODE_LIST.index(NEG)]
-        write_key_dir = (gate_write_at_sp * sp_dir +
+        # ==========================================
+        # MEMORY WRITE BUS (not a transformer layer — cache I/O)
+        # ==========================================
+        # Compute stack write position from pre-update SP direction
+        sp_dec1 = R_SP_DEC @ sp_dir_pre
+        sp_dec2 = R_SP_DEC2 @ sp_dir_pre
+        gate_write_at_sp = acts[CONST_ACT_IDX] + acts[DUP_ACT_IDX]
+        gate_write_at_sp2 = acts[ADD_ACT_IDX] + acts[SUB_ACT_IDX] + acts[MUL_ACT_IDX]
+        gate_write_at_sp1 = acts[NEG_ACT_IDX]
+        write_key_dir = (gate_write_at_sp * sp_dir_pre +
                          gate_write_at_sp2 * sp_dec2 +
                          gate_write_at_sp1 * sp_dec1)
-
-        # State writeback: store new PC and SP directly, then overwrite
-        # (In a real transformer, this would be done by a layer whose W2
-        # writes to both NEW_PC and PC_DIR dims with appropriate signs.
-        # Here we write to NEW_PC dims, then copy to PC/SP dims.)
-        x[NEW_PC] = new_pc
-        x[NEW_SP] = new_sp
-        x[PC_DIR] = new_pc
-        x[SP_DIR] = new_sp
-
-        # Increment cycle counter
-        x[CYCLE_CTR] += 1.0
 
         # ==========================================
         # OUTPUT: KV Cache Write
@@ -545,28 +644,22 @@ class RealTransformerComputer:
             {1: stack_val, 2: stack_val}
         )
 
-        # Save halt_flag before clearing
-        is_halted = x[HALT_FLAG] > 0.5
+        # SAVE HALT SIGNAL BEFORE CLEARING STATE
+        # Return the halt signal BEFORE persistence mask clears it
+        halt_signal = x[HALT_FLAG]
 
-        # Clear transient dims for next cycle (state writeback)
-        x[OPCODE_RAW] = 0.0
-        x[ARG_FLOAT] = 0.0
-        x[ACT] = 0.0
-        x[VAL_A] = 0.0
-        x[VAL_B] = 0.0
-        x[ALU_RESULT] = 0.0
-        x[JMP_TGT] = 0.0
-        x[ZERO_FLAG] = 0.0
-        x[HALT_FLAG] = 0.0
-        x[WRITE_FLAG] = 0.0
-        x[NEW_PC] = 0.0
-        x[NEW_SP] = 0.0
+        # MATRIX OPERATION: Clear transient dims via element-wise multiplication
+        # Persistent dims (PC, SP, CYCLE_CTR) are multiplied by 1.0
+        # Temporary dims are multiplied by 0.0 (cleared)
+        x = x * PERSISTENCE_MASK
 
         # Save residual stream
         self.residual_stream = x
         self.cycle_count += 1  # for trace only
 
-        return is_halted  # the only "conditional" — loop termination signal
+        # Return the halt SIGNAL (not interpreted)
+        # Let external code (run()) decide when to stop
+        return halt_signal  # Return the signal value captured BEFORE clearing
 
     # ==============================================================
     # RUN
@@ -577,10 +670,10 @@ class RealTransformerComputer:
         self.load_program(program)
 
         for _ in range(max_cycles):
-            halted = self.forward_pass()
+            halt_signal = self.forward_pass()  # Get the signal value
             if verbose:
                 print(f"  cycle {self.cycle_count}")
-            if halted:
+            if halt_signal > 0.5:  # Interpret signal as halt threshold
                 break
 
         # Read result from stack via attention.
@@ -588,7 +681,8 @@ class RealTransformerComputer:
         sp_dir = self.residual_stream[SP_DIR]
         q_top = R_SP_DEC @ sp_dir
         result = self.stack_cache.query(1, q_top)
-        return [float(result) if result is not None else 0.0]
+        # No ternary needed - cache pre-seeding guarantees result is never None
+        return [float(result)]
 
 
 # ================================================================
