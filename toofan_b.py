@@ -448,7 +448,8 @@ class RealTransformerComputer:
       - self.stack_cache: KV cache for stack memory
     """
 
-    def __init__(self):
+    def __init__(self, max_tokens=4096):
+        self.max_tokens = max_tokens
         # Build fixed weight matrices (these are the "hand-crafted weights")
         # Layer 2: Standard FFN (tent function opcode decode)
         self.W1_L2, self.b1_L2, self.W2_L2, self.b2_L2 = _build_layer2_weights()
@@ -492,8 +493,8 @@ class RealTransformerComputer:
         self.residual_stream[PC_DIR] = addr_to_2d(0, MAX_ADDRS)
         self.residual_stream[SP_DIR] = make_stack_key(0)
 
-        self.instr_cache = MatrixKVCache(n_heads=1)
-        self.stack_cache = MatrixKVCache(n_heads=3)
+        self.instr_cache = MatrixKVCache(n_heads=1, max_tokens=self.max_tokens)
+        self.stack_cache = MatrixKVCache(n_heads=3, max_tokens=self.max_tokens)
 
         # Pre-seed stack cache with default 0.0 at a far location to eliminate None returns
         # This is like initializing stack memory to zeros
