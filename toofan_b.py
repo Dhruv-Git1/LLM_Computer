@@ -6,10 +6,10 @@ Unlike toofan_a.py, this implementation has ZERO Python if/elif in the forward
 pass. ALL computation happens via matrix multiplies, ReLU, and argmax attention.
 
 Architecture:
-  - d_model = 28 (28-dimensional residual stream)
+  - d_model = 30 (30-dimensional residual stream)
   - 5 layers (fetch, decode, operand fetch, ALU, branch+writeback)
   - 3 attention heads (instruction, stack_top, stack_second)
-  - 9 opcodes: CONST, ADD, SUB, MUL, HALT, DUP, NEG, JMP, JZ
+  - 10 opcodes: CONST, ADD, SUB, MUL, HALT, DUP, NEG, JMP, JZ, JN
 """
 
 import numpy as np
@@ -17,7 +17,7 @@ from toofan_a import (
     NaiveKVCache, HullKVCache, ConvexHull2D,
     addr_to_2d, make_stack_key, make_stack_query,
     run_reference,
-    CONST, ADD, SUB, MUL, HALT, DUP, NEG, JMP, JZ,
+    CONST, ADD, SUB, MUL, HALT, DUP, NEG, JMP, JZ, JN,
     OP_NAME,
 )
 
@@ -74,17 +74,17 @@ class MatrixKVCache:
 # ================================================================
 # CONSTANTS
 # ================================================================
-D_MODEL = 28          # residual stream width
-N_OPCODES = 9         # number of supported opcodes
+D_MODEL = 30          # residual stream width
+N_OPCODES = 10        # number of supported opcodes
 MAX_ADDRS = 65536     # instruction address space
 MAX_STACKD = 32       # stack depth (wide angular separation)
 
 # Opcode list in activation-dim order (dims 6-14)
-OPCODE_LIST = [CONST, ADD, SUB, MUL, HALT, DUP, NEG, JMP, JZ]
+OPCODE_LIST = [CONST, ADD, SUB, MUL, HALT, DUP, NEG, JMP, JZ, JN]
 OPCODE_TO_ACT_DIM = {op: 6 + i for i, op in enumerate(OPCODE_LIST)}
 
 # Pre-computed opcode indices in OPCODE_LIST (for use in forward_pass without .index())
-# OPCODE_LIST = [CONST, ADD, SUB, MUL, HALT, DUP, NEG, JMP, JZ]
+# OPCODE_LIST = [CONST, ADD, SUB, MUL, HALT, DUP, NEG, JMP, JZ, JN]
 CONST_ACT_IDX = 0
 ADD_ACT_IDX = 1
 SUB_ACT_IDX = 2
@@ -94,6 +94,7 @@ DUP_ACT_IDX = 5
 NEG_ACT_IDX = 6
 JMP_ACT_IDX = 7
 JZ_ACT_IDX = 8
+JN_ACT_IDX = 9
 
 # ================================================================
 # WRITE_FLAG SELECTOR MATRIX (pure matrix operation)
@@ -102,7 +103,7 @@ JZ_ACT_IDX = 8
 # Non-writing: HALT, JMP, JZ
 # Selector is 9-element vector: 1.0 at writing positions, 0.0 elsewhere
 WRITING_OPCODES = [CONST, ADD, SUB, MUL, DUP, NEG]
-WRITE_FLAG_SELECTOR = np.zeros(9, dtype=np.float64)
+WRITE_FLAG_SELECTOR = np.zeros(10, dtype=np.float64)
 for op in WRITING_OPCODES:
     idx = OPCODE_LIST.index(op)
     WRITE_FLAG_SELECTOR[idx] = 1.0
@@ -117,17 +118,18 @@ PC_DIR     = slice(0, 2)    # (2) PC as 2D unit vector
 SP_DIR     = slice(2, 4)    # (2) SP as 2D unit vector
 OPCODE_RAW = 4              # (1) fetched opcode (as float)
 ARG_FLOAT  = 5              # (1) fetched instruction argument
-ACT        = slice(6, 15)   # (9) one-hot opcode activations
-VAL_A      = 15             # (1) stack second-from-top
-VAL_B      = 16             # (1) stack top
-ALU_RESULT = 17             # (1) arithmetic output
-JMP_TGT    = slice(18, 20)  # (2) 2D direction of jump target
-ZERO_FLAG  = 20             # (1) 1.0 if val_b == 0
-NEW_PC     = slice(21, 23)  # (2) computed next PC direction
-NEW_SP     = slice(23, 25)  # (2) computed next SP direction
-HALT_FLAG  = 25             # (1) 1.0 if HALT
-WRITE_FLAG = 26             # (1) 1.0 if stack write needed
-CYCLE_CTR  = 27             # (1) monotonic cycle counter
+ACT        = slice(6, 16)   # (10) one-hot opcode activations
+VAL_A      = 16             # (1) stack second-from-top
+VAL_B      = 17             # (1) stack top
+ALU_RESULT = 18             # (1) arithmetic output
+JMP_TGT    = slice(19, 21)  # (2) 2D direction of jump target
+ZERO_FLAG  = 21             # (1) 1.0 if val_b == 0
+NEG_FLAG   = 22             # (1) 1.0 if val_b < 0
+NEW_PC     = slice(23, 25)  # (2) computed next PC direction
+NEW_SP     = slice(25, 27)  # (2) computed next SP direction
+HALT_FLAG  = 27             # (1) 1.0 if HALT
+WRITE_FLAG = 28             # (1) 1.0 if stack write needed
+CYCLE_CTR  = 29             # (1) monotonic cycle counter
 
 # Helper to get activation dim index for an opcode
 def act_idx(op):
@@ -242,7 +244,7 @@ def _build_layer4_glu_weights():
     """
     Build GLU-style FFN weights for the ALU layer.
 
-    Hidden layer (11 units):
+    Hidden layer (18 units):
       h0:  act_CONST * arg           → ALU_RESULT
       h1:  act_ADD * (a+b)           → ALU_RESULT
       h2:  act_SUB * (a-b)           → ALU_RESULT
@@ -253,13 +255,15 @@ def _build_layer4_glu_weights():
       h7:  ReLU(val_b) * 1           → ZERO_FLAG  (-1/eps)
       h8:  ReLU(-val_b) * 1          → ZERO_FLAG  (-1/eps)
       h9:  1 * act_HALT              → HALT_FLAG
-      h10: 1 * (writing acts sum)    → WRITE_FLAG
+      h10: ReLU(-val_b) * 1          → NEG_FLAG   (+1/eps ramp up)
+      h11: ReLU(-val_b - eps) * 1   → NEG_FLAG   (-1/eps clamp at 1.0)
+      h12-h17: write_flag per writing opcode
 
     MUL uses a*b = ((a+b)^2 - (a-b)^2)/4.
     Squaring: (act_MUL*(a+b))^2 = act_MUL*(a+b)^2 since act_MUL ∈ {0,1}.
     """
-    # 7 ALU ops + 2 zero_flag + 1 halt + 6 write_flag = 16
-    d_hidden = 16
+    # 7 ALU ops + 2 zero_flag + 1 halt + 2 neg_flag + 6 write_flag = 18
+    d_hidden = 18
     mul_indices = np.array([3, 4])
     eps_zf = 1e-9
 
@@ -326,12 +330,25 @@ def _build_layer4_glu_weights():
     b1b[9] = 1.0
     W2[HALT_FLAG, 9] = 1.0
 
-    # h10-h15: write_flag — one hidden unit per writing opcode
+    # h10-h11: neg_flag (clamped to [0, 1]) — two neurons for ramp + clamp
+    # NEG_FLAG = min(ReLU(-val_b)/eps, 1.0) ≈ 1.0 if val_b < -eps, 0.0 if val_b >= 0
+    # h10: ramp up: gate=ReLU(-val_b), value=1.0 → contributes +(-val_b)/eps
+    W1a[10, VAL_B] = -1.0             # gate = ReLU(-val_b)
+    b1b[10] = 1.0                      # value = 1.0
+    W2[NEG_FLAG, 10] = 1.0 / eps_zf   # +1/eps * max(0, -val_b)
+
+    # h11: clamp at 1.0: gate=ReLU(-val_b - eps), value=1.0 → subtracts overshoot
+    W1a[11, VAL_B] = -1.0             # gate = ReLU(-val_b - eps)
+    b1a[11] = -eps_zf                  # bias shifts threshold to -eps
+    b1b[11] = 1.0                      # value = 1.0
+    W2[NEG_FLAG, 11] = -1.0 / eps_zf  # -1/eps * max(0, -val_b - eps)
+
+    # h12-h17: write_flag — one hidden unit per writing opcode
     # (Can't sum activations in one gate because tent function makes
     # non-active opcodes negative. Each needs separate ReLU gate.)
     for i, op_idx in enumerate([CONST_ACT_IDX, ADD_ACT_IDX, SUB_ACT_IDX,
                                 MUL_ACT_IDX, DUP_ACT_IDX, NEG_ACT_IDX]):
-        h = 10 + i
+        h = 12 + i
         W1a[h, 6 + op_idx] = 1.0    # gate = ReLU(act_OP)
         b1b[h] = 1.0                  # value = 1.0
         W2[WRITE_FLAG, h] = 1.0       # sum into write_flag
@@ -352,14 +369,15 @@ def _build_layer5_glu_weights():
     Tent function produces negative values for non-active opcodes,
     so each opcode gets its own hidden unit (can't sum activations).
 
-    Hidden layer (18 units):
+    Hidden layer (22 units):
       h0-h1:   act_JMP * delta_pc per component
       h2-h3:   AND(act_JZ, zero_flag) * delta_pc per component
-      h4-h11:  SP decrement: 4 opcodes × 2 components (ADD, SUB, MUL, JZ)
-      h12-h15: SP increment: 2 opcodes × 2 components (CONST, DUP)
-      h16-h17: PC pass-through (baseline advance)
+      h4-h5:   AND(act_JN, neg_flag) * delta_pc per component
+      h6-h15:  SP decrement: 5 opcodes × 2 components (ADD, SUB, MUL, JZ, JN)
+      h16-h19: SP increment: 2 opcodes × 2 components (CONST, DUP)
+      h20-h21: PC pass-through (baseline advance)
     """
-    d_hidden = 18
+    d_hidden = 22
 
     W1a = np.zeros((d_hidden, D_MODEL), dtype=np.float64)
     b1a = np.zeros(d_hidden, dtype=np.float64)
@@ -373,56 +391,67 @@ def _build_layer5_glu_weights():
         # h0,h1: JMP gating
         h_jmp = k
         W1a[h_jmp, 6 + JMP_ACT_IDX] = 1.0
-        W1b[h_jmp, 18 + k] = 1.0
+        W1b[h_jmp, JMP_TGT.start + k] = 1.0
         W1b[h_jmp, 0] = -R_PC[k, 0]
         W1b[h_jmp, 1] = -R_PC[k, 1]
         W2[k, h_jmp] = 1.0
-        W2[21 + k, h_jmp] = 1.0
+        W2[NEW_PC.start + k, h_jmp] = 1.0
 
-        # h2,h3: JZ AND gate
+        # h2,h3: JZ AND gate — AND(act_JZ, zero_flag)
         h_jz = 2 + k
         W1a[h_jz, 6 + JZ_ACT_IDX] = 1.0
         W1a[h_jz, ZERO_FLAG] = 1.0
         b1a[h_jz] = -1.5
-        W1b[h_jz, 18 + k] = 1.0
+        W1b[h_jz, JMP_TGT.start + k] = 1.0
         W1b[h_jz, 0] = -R_PC[k, 0]
         W1b[h_jz, 1] = -R_PC[k, 1]
         W2[k, h_jz] = 2.0
-        W2[21 + k, h_jz] = 2.0
+        W2[NEW_PC.start + k, h_jz] = 2.0
+
+        # h4,h5: JN AND gate — AND(act_JN, neg_flag)
+        h_jn = 4 + k
+        W1a[h_jn, 6 + JN_ACT_IDX] = 1.0
+        W1a[h_jn, NEG_FLAG] = 1.0
+        b1a[h_jn] = -1.5
+        W1b[h_jn, JMP_TGT.start + k] = 1.0
+        W1b[h_jn, 0] = -R_PC[k, 0]
+        W1b[h_jn, 1] = -R_PC[k, 1]
+        W2[k, h_jn] = 2.0
+        W2[NEW_PC.start + k, h_jn] = 2.0
 
     # --- SP decrement: one hidden unit per opcode per component ---
-    # Opcodes that decrement SP: ADD, SUB, MUL, JZ
-    dec_opcodes = [ADD_ACT_IDX, SUB_ACT_IDX, MUL_ACT_IDX, JZ_ACT_IDX]
+    # Opcodes that decrement SP: ADD, SUB, MUL, JZ, JN
+    dec_opcodes = [ADD_ACT_IDX, SUB_ACT_IDX, MUL_ACT_IDX, JZ_ACT_IDX, JN_ACT_IDX]
     for i, op_idx in enumerate(dec_opcodes):
         for k in range(2):
-            h = 4 + i * 2 + k
+            h = 6 + i * 2 + k
             W1a[h, 6 + op_idx] = 1.0             # gate = ReLU(act_OP)
             W1b[h, 2] = R_SP_DEC[k, 0] - (1.0 if k == 0 else 0.0)
             W1b[h, 3] = R_SP_DEC[k, 1] - (1.0 if k == 1 else 0.0)
             W2[2 + k, h] = 1.0                    # → SP_DIR[k]
-            W2[23 + k, h] = 1.0                   # → NEW_SP[k]
+            W2[NEW_SP.start + k, h] = 1.0         # → NEW_SP[k]
 
     # --- SP increment: one hidden unit per opcode per component ---
     # Opcodes that increment SP: CONST, DUP
     inc_opcodes = [CONST_ACT_IDX, DUP_ACT_IDX]
     for i, op_idx in enumerate(inc_opcodes):
         for k in range(2):
-            h = 12 + i * 2 + k
+            h = 16 + i * 2 + k
             W1a[h, 6 + op_idx] = 1.0
             W1b[h, 2] = R_SP_INC[k, 0] - (1.0 if k == 0 else 0.0)
             W1b[h, 3] = R_SP_INC[k, 1] - (1.0 if k == 1 else 0.0)
             W2[2 + k, h] = 1.0
-            W2[23 + k, h] = 1.0
+            W2[NEW_SP.start + k, h] = 1.0
 
     # --- PC pass-through (baseline advance) ---
     for k in range(2):
-        h_pt = 16 + k
+        h_pt = 20 + k
         b1a[h_pt] = 1.0                          # constant gate = 1.0
         W1b[h_pt, k] = 1.0                       # pc_dir[k]
         W2[0, h_pt] = R_PC[0, k] - (1.0 if k == 0 else 0.0)
         W2[1, h_pt] = R_PC[1, k] - (1.0 if k == 1 else 0.0)
-        W2[21, h_pt] = R_PC[0, k] - (1.0 if k == 0 else 0.0)
-        W2[22, h_pt] = R_PC[1, k] - (1.0 if k == 1 else 0.0)
+        W2[NEW_PC.start, h_pt] = R_PC[0, k] - (1.0 if k == 0 else 0.0)
+        W2[NEW_PC.start + 1, h_pt] = R_PC[1, k] - (1.0 if k == 1 else 0.0)
 
     # Cycle counter: constant +1 via bias
     b2[CYCLE_CTR] = 1.0
@@ -443,7 +472,7 @@ class RealTransformerComputer:
       x = x + FFN(x)                   # layers 2, 4, 5
 
     State is ONLY:
-      - self.residual_stream: np.array of shape (28,)
+      - self.residual_stream: np.array of shape (30,)
       - self.instr_cache: KV cache for instructions
       - self.stack_cache: KV cache for stack memory
     """
@@ -466,12 +495,12 @@ class RealTransformerComputer:
         self.W_Q_L1 = np.zeros((2, D_MODEL), dtype=np.float64)
         self.W_Q_L1[0:2, 0:2] = np.eye(2)
 
-        # Layer 1: W_O projects 4 fetched values to dims 4, 5, 18, 19
+        # Layer 1: W_O projects 4 fetched values to dims OPCODE_RAW, ARG_FLOAT, JMP_TGT
         self.W_O_L1 = np.zeros((D_MODEL, 4), dtype=np.float64)
         self.W_O_L1[OPCODE_RAW, 0] = 1.0     # opcode → dim 4
         self.W_O_L1[ARG_FLOAT, 1] = 1.0      # arg → dim 5
-        self.W_O_L1[18, 2] = 1.0             # tgt_cos → dim 18
-        self.W_O_L1[19, 3] = 1.0             # tgt_sin → dim 19
+        self.W_O_L1[JMP_TGT.start, 2] = 1.0  # tgt_cos → dim 19
+        self.W_O_L1[JMP_TGT.start + 1, 3] = 1.0  # tgt_sin → dim 20
 
         # Layer 3: W_Q for stack reads
         self.W_Q_head1 = np.zeros((2, D_MODEL), dtype=np.float64)
@@ -482,8 +511,8 @@ class RealTransformerComputer:
 
         # Layer 3: W_O projects [va, vb] into residual stream
         self.W_O_L3 = np.zeros((D_MODEL, 2), dtype=np.float64)
-        self.W_O_L3[VAL_A, 0] = 1.0          # va → dim 15
-        self.W_O_L3[VAL_B, 1] = 1.0          # vb → dim 16
+        self.W_O_L3[VAL_A, 0] = 1.0          # va → dim 16
+        self.W_O_L3[VAL_B, 1] = 1.0          # vb → dim 17
 
         self.reset()
 
@@ -556,7 +585,7 @@ class RealTransformerComputer:
         # W_O: project fetched 4-tuple into residual stream via residual connection
         # No Python ternaries — cache is pre-seeded, so fetched is never None
         fetched_vec = np.array(fetched, dtype=np.float64)  # shape (4,)
-        attn1 = self.W_O_L1 @ fetched_vec  # project to dims 4, 5, 18, 19
+        attn1 = self.W_O_L1 @ fetched_vec  # project to dims 4, 5, 19, 20
         x = x + attn1  # residual connection
 
         # ==========================================
@@ -566,7 +595,7 @@ class RealTransformerComputer:
         # ffn_out = W2 @ hidden + b2
         hidden2 = np.maximum(0, self.W1_L2 @ x + self.b1_L2)
         ffn2 = self.W2_L2 @ hidden2 + self.b2_L2
-        x = x + ffn2  # residual connection: writes one-hot to dims 6-14
+        x = x + ffn2  # residual connection: writes one-hot to dims 6-15
 
         # ==========================================
         # LAYER 3: Operand Fetch (Attention)
@@ -581,7 +610,7 @@ class RealTransformerComputer:
 
         # W_O: project [va, vb] into residual stream via matrix multiply
         fetched_stack = np.array([va, vb], dtype=np.float64)
-        attn3 = self.W_O_L3 @ fetched_stack  # shape (28,)
+        attn3 = self.W_O_L3 @ fetched_stack  # shape (30,)
         x = x + attn3  # residual connection
 
         # ==========================================

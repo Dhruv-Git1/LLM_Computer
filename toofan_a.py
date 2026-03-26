@@ -34,10 +34,12 @@ LOAD    = 10   # LOAD addr      — push value from memory[addr]
 STORE   = 11   # STORE addr     — pop top; store to memory[addr]
 CMP_LT  = 12   # CMP_LT         — pop b, a; push (a < b) ? 1 : 0
 SWAP    = 13   # SWAP            — swap top two stack elements
+JN      = 14   # JN addr        — pop top; jump to addr if negative
 
 OP_NAME = {CONST:"CONST", ADD:"ADD", SUB:"SUB", MUL:"MUL",
            HALT:"HALT", DUP:"DUP", NEG:"NEG", JMP:"JMP", JZ:"JZ",
-           LOAD:"LOAD", STORE:"STORE", CMP_LT:"CMP_LT", SWAP:"SWAP"}
+           LOAD:"LOAD", STORE:"STORE", CMP_LT:"CMP_LT", SWAP:"SWAP",
+           JN:"JN"}
 
 # ================================================================
 # PART 1: Ground-truth stack machine (reference implementation)
@@ -102,6 +104,14 @@ def run_reference(program, max_cycles=100000):
         elif code == SWAP:
             stack[-1], stack[-2] = stack[-2], stack[-1]
             trace.append(f"  SWAP          | stack = {stack}")
+        elif code == JN:
+            val = stack.pop()
+            if val < 0:
+                pc = op[1]
+                trace.append(f"  JN {op[1]} (taken)| stack = {stack}")
+                continue
+            else:
+                trace.append(f"  JN {op[1]} (skip) | stack = {stack}")
         pc += 1
     return stack, trace
 
