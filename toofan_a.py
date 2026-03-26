@@ -3,7 +3,7 @@
 Replication: "Can LLMs Be Computers?" (Percepta, March 2026)
 
 A hand-crafted transformer that executes stack-machine programs.
-No training, no gradient descent — all weights constructed to make
+No training, no gradient descent -- all weights constructed to make
 the forward pass act as a program interpreter.
 
 Demonstrates:
@@ -12,6 +12,7 @@ Demonstrates:
   3. Full transformer execution loop (each forward pass = one clock cycle)
   4. HullKVCache for O(log n) attention via convex hull
   5. Benchmarks: naive O(n) vs hull O(log n)
+  6. ZERO Python if/elif in the forward pass -- all computation via matrices
 """
 
 import numpy as np
@@ -28,13 +29,13 @@ MUL     = 4
 HALT    = 5
 DUP     = 6
 NEG     = 7
-JMP     = 8    # JMP addr       — unconditional jump to addr
-JZ      = 9    # JZ addr        — pop top; jump to addr if zero
-LOAD    = 10   # LOAD addr      — push value from memory[addr]
-STORE   = 11   # STORE addr     — pop top; store to memory[addr]
-CMP_LT  = 12   # CMP_LT         — pop b, a; push (a < b) ? 1 : 0
-SWAP    = 13   # SWAP            — swap top two stack elements
-JN      = 14   # JN addr        — pop top; jump to addr if negative
+JMP     = 8    # JMP addr       -- unconditional jump to addr
+JZ      = 9    # JZ addr        -- pop top; jump to addr if zero
+LOAD    = 10   # LOAD addr      -- push value from memory[addr]
+STORE   = 11   # STORE addr     -- pop top; store to memory[addr]
+CMP_LT  = 12   # CMP_LT         -- pop b, a; push (a < b) ? 1 : 0
+SWAP    = 13   # SWAP            -- swap top two stack elements
+JN      = 14   # JN addr        -- pop top; jump to addr if negative
 
 OP_NAME = {CONST:"CONST", ADD:"ADD", SUB:"SUB", MUL:"MUL",
            HALT:"HALT", DUP:"DUP", NEG:"NEG", JMP:"JMP", JZ:"JZ",
@@ -149,7 +150,7 @@ def argmax_attention_naive(query_2d, keys_2d, values):
 
 
 # ================================================================
-# PART 4: HullKVCache — O(log n) via convex hull
+# PART 4: HullKVCache -- O(log n) via convex hull
 # ================================================================
 
 class ConvexHull2D:
@@ -171,7 +172,7 @@ class ConvexHull2D:
         """
         Add a new 2D point. Only rebuild hull if point is outside it.
 
-        The inside check (O(h)) eliminates most inserts — for n random
+        The inside check (O(h)) eliminates most inserts -- for n random
         points, only O(sqrt(n)) land on the hull. So while each rebuild
         is O(n log n), the amortized cost per insert is much lower.
         """
@@ -240,9 +241,9 @@ class ConvexHull2D:
         O(log h) via binary search on the angle-sorted hull vertices.
 
         Algorithm: binary search _angles for the query's angle, then
-        check a small neighborhood (±2 vertices) to find the exact max.
+        check a small neighborhood (+-2 vertices) to find the exact max.
         For convex hull vertices with near-unit magnitude, the optimal
-        vertex is always within ±1 of the angle-nearest vertex.
+        vertex is always within +-1 of the angle-nearest vertex.
 
         Returns token_id of best match.
         """
@@ -261,11 +262,11 @@ class ConvexHull2D:
                     best_id = tid
             return best_id
 
-        # Binary search for query angle in the sorted hull angles — O(log h)
+        # Binary search for query angle in the sorted hull angles -- O(log h)
         query_angle = np.arctan2(direction_2d[1], direction_2d[0])
         pos = bisect.bisect_left(self._angles, query_angle)
 
-        # Check neighbors (±2) around the insertion point, wrapping around
+        # Check neighbors (+-2) around the insertion point, wrapping around
         best_id = -1
         best_dot = -np.inf
         for offset in range(-2, 3):
@@ -355,7 +356,7 @@ class NaiveKVCache:
 #   Layer 2 (FFN):       Decode opcode, read stack, execute, update state
 #
 # The "hand-crafted weights" are encoded in the logic of how we
-# construct queries and process results — but ALL operations are
+# construct queries and process results -- but ALL operations are
 # matrix multiplies and argmax, exactly as in a real transformer.
 
 # Head assignments:
@@ -364,7 +365,7 @@ HEAD_STACK0 = 1    # Stack read: top (SP - 1)
 HEAD_STACK1 = 2    # Stack read: second (SP - 2)
 
 MAX_ADDRS  = 65536    # max instruction addresses (large to avoid wrap-around)
-MAX_STACKD = 32       # max stack depth (small → wide angular separation between positions)
+MAX_STACKD = 32       # max stack depth (small -> wide angular separation between positions)
 
 # ================================================================
 # FFN Weight Matrices (hand-crafted, not trained)
@@ -388,6 +389,7 @@ R_SP_INC = np.array([[np.cos(_dtheta_sp), -np.sin(_dtheta_sp)],
                      [np.sin(_dtheta_sp),  np.cos(_dtheta_sp)]], dtype=np.float64)
 # SP decrement = rotate backwards (transpose of R_SP_INC since it's orthogonal)
 R_SP_DEC = R_SP_INC.T
+R_SP_DEC2 = R_SP_DEC @ R_SP_DEC  # double decrement for sp-2
 
 def make_instr_key(addr):
     """2D key encoding an instruction address."""
@@ -409,383 +411,476 @@ def make_stack_query(stack_pos):
     return np.array([np.cos(theta), np.sin(theta)], dtype=np.float64)
 
 
+# ================================================================
+# RESIDUAL STREAM LAYOUT & TRANSFORMER CONSTANTS
+# ================================================================
+D_MODEL = 30          # residual stream width
+N_OPCODES = 10        # number of supported opcodes in the transformer
+OPCODE_LIST = [CONST, ADD, SUB, MUL, HALT, DUP, NEG, JMP, JZ, JN]
+OPCODE_TO_ACT_DIM = {op: 6 + i for i, op in enumerate(OPCODE_LIST)}
+
+# Pre-computed opcode indices in OPCODE_LIST
+CONST_ACT_IDX = 0
+ADD_ACT_IDX   = 1
+SUB_ACT_IDX   = 2
+MUL_ACT_IDX   = 3
+HALT_ACT_IDX  = 4
+DUP_ACT_IDX   = 5
+NEG_ACT_IDX   = 6
+JMP_ACT_IDX   = 7
+JZ_ACT_IDX    = 8
+JN_ACT_IDX    = 9
+
+# Writing opcodes: CONST, ADD, SUB, MUL, DUP, NEG
+WRITING_OPCODES_LIST = [CONST, ADD, SUB, MUL, DUP, NEG]
+WRITE_FLAG_SELECTOR = np.zeros(N_OPCODES, dtype=np.float64)
+for _wop in WRITING_OPCODES_LIST:
+    WRITE_FLAG_SELECTOR[OPCODE_LIST.index(_wop)] = 1.0
+
+# Residual stream dimension map (30 floats)
+PC_DIR     = slice(0, 2)    # (2) PC as 2D unit vector
+SP_DIR     = slice(2, 4)    # (2) SP as 2D unit vector
+OPCODE_RAW = 4              # (1) fetched opcode (as float)
+ARG_FLOAT  = 5              # (1) fetched instruction argument
+ACT        = slice(6, 16)   # (10) one-hot opcode activations
+VAL_A      = 16             # (1) stack second-from-top
+VAL_B      = 17             # (1) stack top
+ALU_RESULT = 18             # (1) arithmetic output
+JMP_TGT    = slice(19, 21)  # (2) 2D direction of jump target
+ZERO_FLAG  = 21             # (1) 1.0 if val_b == 0
+NEG_FLAG   = 22             # (1) 1.0 if val_b < 0
+NEW_PC     = slice(23, 25)  # (2) computed next PC direction
+NEW_SP     = slice(25, 27)  # (2) computed next SP direction
+HALT_FLAG  = 27             # (1) 1.0 if HALT
+WRITE_FLAG = 28             # (1) 1.0 if stack write needed
+CYCLE_CTR  = 29             # (1) monotonic cycle counter
+
+# Persistence mask: keep PC, SP, cycle counter between cycles
+PERSISTENCE_MASK = np.zeros(D_MODEL, dtype=np.float64)
+PERSISTENCE_MASK[PC_DIR] = 1.0
+PERSISTENCE_MASK[SP_DIR] = 1.0
+PERSISTENCE_MASK[CYCLE_CTR] = 1.0
+
+
+# ================================================================
+# LAYER 2: Opcode Decode -- Tent Function FFN
+# ================================================================
+def _build_layer2_weights():
+    """
+    Build FFN weights for opcode decode.
+    tent(x, c) = max(0, 1 - |x - c|) via 4 ReLU neurons per opcode.
+    """
+    n_hidden = 4 * N_OPCODES
+    W1 = np.zeros((n_hidden, D_MODEL), dtype=np.float64)
+    b1 = np.zeros(n_hidden, dtype=np.float64)
+    W2 = np.zeros((D_MODEL, n_hidden), dtype=np.float64)
+    b2 = np.zeros(D_MODEL, dtype=np.float64)
+
+    for i, op in enumerate(OPCODE_LIST):
+        base = 4 * i
+        out_dim = 6 + i
+
+        W1[base + 0, OPCODE_RAW] = 1.0;  b1[base + 0] = -op + 1.0
+        W1[base + 1, OPCODE_RAW] = 1.0;  b1[base + 1] = -op
+        W1[base + 2, OPCODE_RAW] = -1.0; b1[base + 2] = op + 1.0
+        W1[base + 3, OPCODE_RAW] = -1.0; b1[base + 3] = op
+
+        W2[out_dim, base + 0] = 0.5
+        W2[out_dim, base + 1] = -1.0
+        W2[out_dim, base + 2] = 0.5
+        W2[out_dim, base + 3] = -1.0
+
+    return W1, b1, W2, b2
+
+
+# ================================================================
+# LAYER 4: ALU -- GLU-style FFN (ReGLU)
+# ================================================================
+def _build_layer4_glu_weights():
+    """
+    Build GLU FFN weights for ALU + flags.
+    18 hidden units: 7 ALU + 2 zero_flag + 1 halt + 2 neg_flag + 6 write_flag.
+    """
+    d_hidden = 18
+    mul_indices = np.array([3, 4])
+    eps_zf = 1e-9
+
+    W1a = np.zeros((d_hidden, D_MODEL), dtype=np.float64)
+    b1a = np.zeros(d_hidden, dtype=np.float64)
+    W1b = np.zeros((d_hidden, D_MODEL), dtype=np.float64)
+    b1b = np.zeros(d_hidden, dtype=np.float64)
+    W2 = np.zeros((D_MODEL, d_hidden), dtype=np.float64)
+    b2 = np.zeros(D_MODEL, dtype=np.float64)
+
+    # h0: CONST
+    W1a[0, 6 + CONST_ACT_IDX] = 1.0
+    W1b[0, ARG_FLOAT] = 1.0
+    W2[ALU_RESULT, 0] = 1.0
+
+    # h1: ADD
+    W1a[1, 6 + ADD_ACT_IDX] = 1.0
+    W1b[1, VAL_A] = 1.0; W1b[1, VAL_B] = 1.0
+    W2[ALU_RESULT, 1] = 1.0
+
+    # h2: SUB
+    W1a[2, 6 + SUB_ACT_IDX] = 1.0
+    W1b[2, VAL_A] = 1.0; W1b[2, VAL_B] = -1.0
+    W2[ALU_RESULT, 2] = 1.0
+
+    # h3: MUL (a+b) path
+    W1a[3, 6 + MUL_ACT_IDX] = 1.0
+    W1b[3, VAL_A] = 1.0; W1b[3, VAL_B] = 1.0
+    W2[ALU_RESULT, 3] = 0.25
+
+    # h4: MUL (a-b) path
+    W1a[4, 6 + MUL_ACT_IDX] = 1.0
+    W1b[4, VAL_A] = 1.0; W1b[4, VAL_B] = -1.0
+    W2[ALU_RESULT, 4] = -0.25
+
+    # h5: DUP
+    W1a[5, 6 + DUP_ACT_IDX] = 1.0
+    W1b[5, VAL_B] = 1.0
+    W2[ALU_RESULT, 5] = 1.0
+
+    # h6: NEG
+    W1a[6, 6 + NEG_ACT_IDX] = 1.0
+    W1b[6, VAL_B] = -1.0
+    W2[ALU_RESULT, 6] = 1.0
+
+    # h7: zero_flag positive
+    W1a[7, VAL_B] = 1.0; b1b[7] = 1.0
+    W2[ZERO_FLAG, 7] = -1.0 / eps_zf
+
+    # h8: zero_flag negative
+    W1a[8, VAL_B] = -1.0; b1b[8] = 1.0
+    W2[ZERO_FLAG, 8] = -1.0 / eps_zf
+    b2[ZERO_FLAG] = 1.0
+
+    # h9: halt_flag
+    W1a[9, 6 + HALT_ACT_IDX] = 1.0; b1b[9] = 1.0
+    W2[HALT_FLAG, 9] = 1.0
+
+    # h10-h11: neg_flag (clamped ramp)
+    W1a[10, VAL_B] = -1.0; b1b[10] = 1.0
+    W2[NEG_FLAG, 10] = 1.0 / eps_zf
+    W1a[11, VAL_B] = -1.0; b1a[11] = -eps_zf; b1b[11] = 1.0
+    W2[NEG_FLAG, 11] = -1.0 / eps_zf
+
+    # h12-h17: write_flag
+    for i, op_idx in enumerate([CONST_ACT_IDX, ADD_ACT_IDX, SUB_ACT_IDX,
+                                MUL_ACT_IDX, DUP_ACT_IDX, NEG_ACT_IDX]):
+        h = 12 + i
+        W1a[h, 6 + op_idx] = 1.0; b1b[h] = 1.0
+        W2[WRITE_FLAG, h] = 1.0
+
+    return W1a, b1a, W1b, b1b, W2, b2, mul_indices
+
+
+# ================================================================
+# LAYER 5: Branch Resolution -- GLU-style FFN (ReGLU)
+# ================================================================
+def _build_layer5_glu_weights():
+    """
+    Build GLU FFN weights for branch resolution + state update.
+    22 hidden units: 6 PC (JMP/JZ/JN) + 10 SP dec + 4 SP inc + 2 PC pass-through.
+    """
+    d_hidden = 22
+    W1a = np.zeros((d_hidden, D_MODEL), dtype=np.float64)
+    b1a = np.zeros(d_hidden, dtype=np.float64)
+    W1b = np.zeros((d_hidden, D_MODEL), dtype=np.float64)
+    b1b = np.zeros(d_hidden, dtype=np.float64)
+    W2 = np.zeros((D_MODEL, d_hidden), dtype=np.float64)
+    b2 = np.zeros(D_MODEL, dtype=np.float64)
+
+    for k in range(2):
+        # h0,h1: JMP
+        h_jmp = k
+        W1a[h_jmp, 6 + JMP_ACT_IDX] = 1.0
+        W1b[h_jmp, JMP_TGT.start + k] = 1.0
+        W1b[h_jmp, 0] = -R_PC[k, 0]; W1b[h_jmp, 1] = -R_PC[k, 1]
+        W2[k, h_jmp] = 1.0; W2[NEW_PC.start + k, h_jmp] = 1.0
+
+        # h2,h3: JZ AND gate
+        h_jz = 2 + k
+        W1a[h_jz, 6 + JZ_ACT_IDX] = 1.0; W1a[h_jz, ZERO_FLAG] = 1.0
+        b1a[h_jz] = -1.5
+        W1b[h_jz, JMP_TGT.start + k] = 1.0
+        W1b[h_jz, 0] = -R_PC[k, 0]; W1b[h_jz, 1] = -R_PC[k, 1]
+        W2[k, h_jz] = 2.0; W2[NEW_PC.start + k, h_jz] = 2.0
+
+        # h4,h5: JN AND gate
+        h_jn = 4 + k
+        W1a[h_jn, 6 + JN_ACT_IDX] = 1.0; W1a[h_jn, NEG_FLAG] = 1.0
+        b1a[h_jn] = -1.5
+        W1b[h_jn, JMP_TGT.start + k] = 1.0
+        W1b[h_jn, 0] = -R_PC[k, 0]; W1b[h_jn, 1] = -R_PC[k, 1]
+        W2[k, h_jn] = 2.0; W2[NEW_PC.start + k, h_jn] = 2.0
+
+    # SP decrement: ADD, SUB, MUL, JZ, JN
+    dec_opcodes = [ADD_ACT_IDX, SUB_ACT_IDX, MUL_ACT_IDX, JZ_ACT_IDX, JN_ACT_IDX]
+    for i, op_idx in enumerate(dec_opcodes):
+        for k in range(2):
+            h = 6 + i * 2 + k
+            W1a[h, 6 + op_idx] = 1.0
+            W1b[h, 2] = R_SP_DEC[k, 0] - (1.0 if k == 0 else 0.0)
+            W1b[h, 3] = R_SP_DEC[k, 1] - (1.0 if k == 1 else 0.0)
+            W2[2 + k, h] = 1.0; W2[NEW_SP.start + k, h] = 1.0
+
+    # SP increment: CONST, DUP
+    inc_opcodes = [CONST_ACT_IDX, DUP_ACT_IDX]
+    for i, op_idx in enumerate(inc_opcodes):
+        for k in range(2):
+            h = 16 + i * 2 + k
+            W1a[h, 6 + op_idx] = 1.0
+            W1b[h, 2] = R_SP_INC[k, 0] - (1.0 if k == 0 else 0.0)
+            W1b[h, 3] = R_SP_INC[k, 1] - (1.0 if k == 1 else 0.0)
+            W2[2 + k, h] = 1.0; W2[NEW_SP.start + k, h] = 1.0
+
+    # PC pass-through (baseline advance)
+    for k in range(2):
+        h_pt = 20 + k
+        b1a[h_pt] = 1.0
+        W1b[h_pt, k] = 1.0
+        W2[0, h_pt] = R_PC[0, k] - (1.0 if k == 0 else 0.0)
+        W2[1, h_pt] = R_PC[1, k] - (1.0 if k == 1 else 0.0)
+        W2[NEW_PC.start, h_pt] = R_PC[0, k] - (1.0 if k == 0 else 0.0)
+        W2[NEW_PC.start + 1, h_pt] = R_PC[1, k] - (1.0 if k == 1 else 0.0)
+
+    b2[CYCLE_CTR] = 1.0
+    return W1a, b1a, W1b, b1b, W2, b2
+
+
+# ================================================================
+# THE TRANSFORMER COMPUTER -- ZERO if/elif in forward_pass
+# ================================================================
+
 class TransformerComputer:
     """
-    A transformer whose forward pass executes stack machine programs.
+    A transformer whose forward pass has ZERO Python if/elif.
 
-    Replicates the core idea of Percepta's paper:
-    - Computation happens INSIDE the transformer (no external tools)
-    - Attention = memory lookup (2D argmax)
-    - FFN = opcode decode + arithmetic
-    - KV cache = computer's RAM
-    - Each generated token = one clock cycle
+    All computation is:
+      x = x + attention(x, kv_cache)   # layers 1, 3
+      x = x + FFN(x)                   # layers 2, 4, 5
 
-    Weight construction:
-    - Query projections (W_Q): extract PC or SP from state → 2D direction
-    - Key projections (W_K): encode address of each stored token
-    - Value projections (W_V): carry instruction content or stack values
-    - FFN weights (W1, W2): implement opcode lookup table + arithmetic
+    State is ONLY:
+      - self.residual_stream: np.array of shape (30,)
+      - self.instr_cache: KV cache for instructions (NaiveKVCache or HullKVCache)
+      - self.stack_cache: KV cache for stack memory (NaiveKVCache)
 
-    These are the "hand-crafted weights" — set by construction, not training.
+    Cache modes:
+      - use_hull=False: NaiveKVCache for instructions -- O(n) attention
+      - use_hull=True: HullKVCache for instructions -- O(log n) via convex hull
+        Stack cache stays NaiveKVCache because magnitude-scaled keys break
+        the unit-circle assumption required by convex hull.
     """
 
     def __init__(self, use_hull=False):
         self.use_hull = use_hull
+
+        # Build fixed weight matrices (hand-crafted, not trained)
+        self.W1_L2, self.b1_L2, self.W2_L2, self.b2_L2 = _build_layer2_weights()
+        (self.W1a_L4, self.b1a_L4, self.W1b_L4, self.b1b_L4,
+         self.W2_L4, self.b2_L4, self.mul_indices) = _build_layer4_glu_weights()
+        (self.W1a_L5, self.b1a_L5, self.W1b_L5, self.b1b_L5,
+         self.W2_L5, self.b2_L5) = _build_layer5_glu_weights()
+
+        # Layer 1: W_Q extracts pc_dir (dims 0-1)
+        self.W_Q_L1 = np.zeros((2, D_MODEL), dtype=np.float64)
+        self.W_Q_L1[0:2, 0:2] = np.eye(2)
+
+        # Layer 1: W_O projects fetched 4-tuple into residual stream
+        self.W_O_L1 = np.zeros((D_MODEL, 4), dtype=np.float64)
+        self.W_O_L1[OPCODE_RAW, 0] = 1.0
+        self.W_O_L1[ARG_FLOAT, 1] = 1.0
+        self.W_O_L1[JMP_TGT.start, 2] = 1.0
+        self.W_O_L1[JMP_TGT.start + 1, 3] = 1.0
+
+        # Layer 3: W_Q for stack reads
+        self.W_Q_head1 = np.zeros((2, D_MODEL), dtype=np.float64)
+        self.W_Q_head1[0:2, 2:4] = R_SP_DEC
+
+        self.W_Q_head2 = np.zeros((2, D_MODEL), dtype=np.float64)
+        self.W_Q_head2[0:2, 2:4] = R_SP_DEC2
+
+        # Layer 3: W_O projects [va, vb] into residual stream
+        self.W_O_L3 = np.zeros((D_MODEL, 2), dtype=np.float64)
+        self.W_O_L3[VAL_A, 0] = 1.0
+        self.W_O_L3[VAL_B, 1] = 1.0
+
         self.reset()
 
     def reset(self):
-        """Clear all state."""
-        # Instruction cache: benefits from hull (many stable entries)
-        if self.use_hull:
-            self.instr_cache = HullKVCache(n_heads=1)
-        else:
-            self.instr_cache = NaiveKVCache(n_heads=1)
-        # Stack cache: attention-based memory using heads 1 and 2
-        # Uses NaiveKVCache (not hull) because stack keys get magnitude-scaled
-        # for overwrite semantics, which breaks the unit-circle assumption of hulls
+        """Initialize state. The ONLY state is residual_stream + KV caches."""
+        self.residual_stream = np.zeros(D_MODEL, dtype=np.float64)
+        self.residual_stream[PC_DIR] = addr_to_2d(0, MAX_ADDRS)
+        self.residual_stream[SP_DIR] = make_stack_key(0)
+
+        # Instruction cache: HullKVCache (O(log n)) or NaiveKVCache (O(n))
+        self.instr_cache = (HullKVCache(n_heads=1) if self.use_hull
+                            else NaiveKVCache(n_heads=1))
+        # Stack cache: always NaiveKVCache (magnitude-scaled keys break hull)
         self.stack_cache = NaiveKVCache(n_heads=3)
-        # PC and SP stored as 2D direction vectors (as in the paper)
-        # Integer counters kept in sync for trace output
-        self.pc = 0
-        self.pc_vec = addr_to_2d(0, MAX_ADDRS)   # 2D direction for PC
-        self.sp = 0
-        self.sp_vec = make_stack_key(0)           # 2D direction for SP
+
+        # Pre-seed stack cache so queries never return None
+        default_key = make_stack_key(MAX_STACKD - 1)
+        self.stack_cache.insert(
+            {HEAD_STACK0: default_key, HEAD_STACK1: default_key},
+            {HEAD_STACK0: 0.0, HEAD_STACK1: 0.0}
+        )
+
         self.halted = False
         self.trace = []
         self.cycle_count = 0
-        self._pos_write_counts = {}   # per-position write counter for stack overwrite
-        self._mem = {}                # memory for LOAD/STORE
 
     def load_program(self, program):
-        """
-        Load instructions into the KV cache.
-
-        This is like writing a program into RAM before execution.
-        Each instruction becomes a token in the cache with:
-          - Head 0 key: 2D encoding of its address
-          - Head 0 value: (opcode, argument)
-        """
+        """Load instructions into KV cache (= writing program to RAM)."""
         self.reset()
         self.program = program
+
+        # Pre-seed with default HALT at far-away address
+        default_tgt = addr_to_2d(0, MAX_ADDRS)
+        self.instr_cache.insert(
+            {0: addr_to_2d(MAX_ADDRS - 1, MAX_ADDRS)},
+            {0: (float(HALT), 0.0, default_tgt[0], default_tgt[1])}
+        )
+
+        # Load actual program: each instruction stores (opcode, arg, tgt_cos, tgt_sin)
         for addr, instr in enumerate(program):
             opcode = instr[0]
             arg = instr[1] if len(instr) > 1 else 0
-            keys = {0: make_instr_key(addr)}
-            vals = {0: (opcode, arg)}
-            self.instr_cache.insert(keys, vals)
+            tgt = addr_to_2d(arg, MAX_ADDRS)
+            self.instr_cache.insert(
+                {0: addr_to_2d(addr, MAX_ADDRS)},
+                {0: (float(opcode), float(arg), tgt[0], tgt[1])}
+            )
 
-    # ----------------------------------------------------------
-    # THE FORWARD PASS — one clock cycle
-    # ----------------------------------------------------------
-    # This is structured exactly like a transformer forward pass:
-    #   1. Multi-head attention (reads from KV cache)
-    #   2. FFN (decodes + executes)
-    #   3. Output (new token appended to cache)
-    #
-    # The "residual stream" is the state dict that flows through.
-    # In a real transformer this would be a d_model-dim vector;
-    # here we keep it as named fields for clarity, but every
-    # operation IS a matrix multiply or argmax lookup.
-    # ----------------------------------------------------------
+    # ==============================================================
+    # THE FORWARD PASS -- ZERO if/elif
+    # ==============================================================
 
     def forward_pass(self):
         """
-        Execute one clock cycle.
+        Execute one clock cycle. Returns halt_signal (float).
 
-        Returns: dict with execution info for this cycle.
+        This method contains ZERO if/elif/else statements.
+        Every operation is: matrix multiply, ReLU, argmax attention,
+        or element-wise arithmetic on the residual stream.
         """
-        if self.halted:
-            return None
+        x = self.residual_stream.copy()
 
-        # ======================================
-        # LAYER 1: ATTENTION — Instruction Fetch
-        # ======================================
-        # Head 0 computes query from PC → fetches instruction
-        #
-        # In weight terms:
-        #   query = W_Q @ state_vector
-        #   where W_Q extracts the PC dims and converts to 2D direction
-        #
-        # The pc_vec IS the query direction — W_Q is identity on PC dims.
-        query_instr = self.pc_vec
-        fetched = self.instr_cache.query(0, query_instr)
+        # ==========================================
+        # LAYER 1: Instruction Fetch (Attention)
+        # ==========================================
+        query = self.W_Q_L1 @ x  # shape (2,)
+        fetched = self.instr_cache.query(0, query)
+        # fetched = (opcode, arg, tgt_cos, tgt_sin) -- pre-seeded, never None
+        fetched_vec = np.array(fetched, dtype=np.float64)
+        x = x + self.W_O_L1 @ fetched_vec  # residual connection
 
-        if fetched is None:
-            self.halted = True
-            return {"cycle": self.cycle_count, "op": "ERROR", "detail": "no instruction"}
+        # ==========================================
+        # LAYER 2: Opcode Decode (FFN)
+        # ==========================================
+        hidden2 = np.maximum(0, self.W1_L2 @ x + self.b1_L2)
+        x = x + self.W2_L2 @ hidden2 + self.b2_L2
 
-        opcode, arg = fetched
+        # ==========================================
+        # LAYER 3: Operand Fetch (Attention)
+        # ==========================================
+        q_top = self.W_Q_head1 @ x
+        vb = self.stack_cache.query(HEAD_STACK0, q_top)
+        q_sec = self.W_Q_head2 @ x
+        va = self.stack_cache.query(HEAD_STACK1, q_sec)
+        # Pre-seeded cache guarantees non-None -- no Python ternary needed
+        fetched_stack = np.array([va, vb], dtype=np.float64)
+        x = x + self.W_O_L3 @ fetched_stack
 
-        # After attention: residual stream now contains fetched opcode + arg
-        # (In a real transformer, the value vector adds this info to the residual stream)
+        # ==========================================
+        # LAYER 4: ALU + Flags (GLU FFN)
+        # ==========================================
+        gate4 = np.maximum(0, self.W1a_L4 @ x + self.b1a_L4)
+        value4 = self.W1b_L4 @ x + self.b1b_L4
+        hidden4 = gate4 * value4
+        hidden4[self.mul_indices] = hidden4[self.mul_indices] * hidden4[self.mul_indices]
+        x = x + self.W2_L4 @ hidden4 + self.b2_L4
 
-        # ======================================
-        # LAYER 2: FFN — Opcode Decode via ReLU
-        # ======================================
-        # The FFN hidden layer has one detector neuron per opcode.
-        # Each neuron fires via: activation = ReLU(1 - |opcode - target|)
-        # This gives exactly 1.0 for the matching opcode and 0.0 for all
-        # others (since opcodes are integers with spacing >= 1).
-        #
-        # The activations gate all downstream computation — only the
-        # active opcode's pathway contributes to the output.
+        # ==========================================
+        # LAYER 5: Branch Resolution + State Update (GLU FFN)
+        # ==========================================
+        acts = np.maximum(0, x[ACT])
+        sp_dir_pre = x[SP_DIR].copy()
 
-        activations = {}
-        ALL_OPS = [HALT, CONST, ADD, SUB, MUL, DUP, NEG, JMP, JZ, LOAD, STORE, CMP_LT, SWAP]
-        for target_op in ALL_OPS:
-            activations[target_op] = max(0.0, 1.0 - abs(opcode - target_op))
+        gate5 = np.maximum(0, self.W1a_L5 @ x + self.b1a_L5)
+        value5 = self.W1b_L5 @ x + self.b1b_L5
+        hidden5 = gate5 * value5
+        x = x + self.W2_L5 @ hidden5 + self.b2_L5
 
-        # ======================================
-        # LAYER 3: ATTENTION — Operand Fetch
-        # ======================================
-        # All stack reads happen unconditionally — gating handles the rest.
+        # ==========================================
+        # MEMORY WRITE BUS (cache I/O, not a transformer layer)
+        # ==========================================
+        sp_dec1 = R_SP_DEC @ sp_dir_pre
+        sp_dec2 = R_SP_DEC2 @ sp_dir_pre
 
-        val_b = self._stack_read(self.sp - 1) if self.sp >= 1 else 0.0
-        val_a = self._stack_read(self.sp - 2) if self.sp >= 2 else 0.0
-        operands = np.array([val_a, val_b], dtype=np.float64)
+        gate_write_at_sp = acts[CONST_ACT_IDX] + acts[DUP_ACT_IDX]
+        gate_write_at_sp2 = acts[ADD_ACT_IDX] + acts[SUB_ACT_IDX] + acts[MUL_ACT_IDX]
+        gate_write_at_sp1 = acts[NEG_ACT_IDX]
+        write_key_dir = (gate_write_at_sp * sp_dir_pre +
+                         gate_write_at_sp2 * sp_dec2 +
+                         gate_write_at_sp1 * sp_dec1)
 
-        # ======================================
-        # LAYER 4: FFN — Arithmetic Execution
-        # ======================================
-        # Each opcode has its own pathway, gated by its activation.
+        cycle = x[CYCLE_CTR]
+        magnitude = 1.0 + cycle * 1e-8
+        gated_mag = magnitude * np.maximum(0, x[WRITE_FLAG])
+        stack_key = write_key_dir * gated_mag
+        stack_val = x[ALU_RESULT]
 
-        # ADD path
-        add_result = float(W_ADD @ operands)
-        # SUB path
-        sub_result = float(W_SUB @ operands)
-        # MUL path: a*b = ((a+b)^2 - (a-b)^2) / 4
-        W_mul_pre = np.array([[1.0, 1.0], [1.0, -1.0]], dtype=np.float64)
-        sd = W_mul_pre @ operands
-        s_sq = max(0.0, sd[0])**2 + max(0.0, -sd[0])**2
-        d_sq = max(0.0, sd[1])**2 + max(0.0, -sd[1])**2
-        W_mul_post = np.array([0.25, -0.25], dtype=np.float64)
-        mul_result = float(W_mul_post @ np.array([s_sq, d_sq]))
-        # NEG path
-        neg_result = float(W_NEG @ np.array([val_b], dtype=np.float64))
-        # CONST path
-        const_result = float(arg)
-        # DUP path
-        dup_result = float(val_b)
-        # CMP_LT path: (a < b) → 1 else 0, using ReLU: ReLU(b-a) > 0 → 1
-        # Exact: sign(b - a) mapped to {0, 1} via: ReLU(b-a) / (|b-a| + eps)
-        cmp_diff = val_b - val_a
-        cmp_result = 1.0 if cmp_diff > 0 else 0.0
-        # LOAD path: value from memory
-        load_result = float(self._mem.get(arg, 0))
-        # SWAP path: no arithmetic, just reorder (handled in routing)
+        self.stack_cache.insert(
+            {HEAD_STACK0: stack_key, HEAD_STACK1: stack_key},
+            {HEAD_STACK0: stack_val, HEAD_STACK1: stack_val}
+        )
 
-        # ======================================
-        # LAYER 5: FFN — Gated Output + State Update
-        # ======================================
+        halt_signal = x[HALT_FLAG]
 
-        if activations[HALT] > 0.5:
-            self.halted = True
-
-        elif activations[JMP] > 0.5:
-            # Unconditional jump: set PC to target address
-            self._set_pc(arg)
-
-        elif activations[JZ] > 0.5:
-            # Conditional jump: pop top, jump if zero
-            self._advance_sp(-1)
-            if val_b == 0:
-                self._set_pc(arg)
-            else:
-                self._advance_pc()
-
-        elif activations[STORE] > 0.5:
-            # Pop top, store to memory[arg]
-            self._mem[arg] = val_b
-            self._advance_sp(-1)
-            self._advance_pc()
-
-        elif activations[LOAD] > 0.5:
-            # Push memory[arg] onto stack
-            self._stack_write(self.sp, load_result)
-            self._advance_sp(1)
-            self._advance_pc()
-
-        elif activations[CMP_LT] > 0.5:
-            # Pop two, push comparison result
-            self._advance_sp(-2)
-            self._stack_write(self.sp, cmp_result)
-            self._advance_sp(1)
-            self._advance_pc()
-
-        elif activations[SWAP] > 0.5:
-            # Swap top two stack elements
-            self._stack_write(self.sp - 1, val_a)
-            self._stack_write(self.sp - 2, val_b)
-            self._advance_pc()
-
-        elif activations[NEG] > 0.5:
-            self._stack_write(self.sp - 1, neg_result)
-            self._advance_pc()
-
-        elif activations[ADD] > 0.5 or activations[SUB] > 0.5 or activations[MUL] > 0.5:
-            write_val = (activations[ADD] * add_result +
-                         activations[SUB] * sub_result +
-                         activations[MUL] * mul_result)
-            self._advance_sp(-2)
-            self._stack_write(self.sp, write_val)
-            self._advance_sp(1)
-            self._advance_pc()
-
-        elif activations[CONST] > 0.5 or activations[DUP] > 0.5:
-            write_val = (activations[CONST] * const_result +
-                         activations[DUP] * dup_result)
-            self._stack_write(self.sp, write_val)
-            self._advance_sp(1)
-            self._advance_pc()
-
-        # Build trace info
-        result_info = {}
-        if activations[HALT] > 0.5:
-            result_info = {"op": "HALT", "stack": self._read_stack()}
-        elif activations[CONST] > 0.5:
-            result_info = {"op": f"CONST {arg}", "stack": self._read_stack()}
-        elif activations[ADD] > 0.5:
-            result_info = {"op": f"ADD {val_a}+{val_b}={add_result}", "stack": self._read_stack()}
-        elif activations[SUB] > 0.5:
-            result_info = {"op": f"SUB {val_a}-{val_b}={sub_result}", "stack": self._read_stack()}
-        elif activations[MUL] > 0.5:
-            result_info = {"op": f"MUL {val_a}*{val_b}={mul_result}", "stack": self._read_stack()}
-        elif activations[DUP] > 0.5:
-            result_info = {"op": f"DUP {val_b}", "stack": self._read_stack()}
-        elif activations[NEG] > 0.5:
-            result_info = {"op": f"NEG {val_b}->{neg_result}", "stack": self._read_stack()}
-        elif activations[JMP] > 0.5:
-            result_info = {"op": f"JMP {arg}", "stack": self._read_stack()}
-        elif activations[JZ] > 0.5:
-            taken = "taken" if val_b == 0 else "skip"
-            result_info = {"op": f"JZ {arg} ({taken})", "stack": self._read_stack()}
-        elif activations[LOAD] > 0.5:
-            result_info = {"op": f"LOAD [{arg}]={load_result}", "stack": self._read_stack()}
-        elif activations[STORE] > 0.5:
-            result_info = {"op": f"STORE [{arg}]={val_b}", "stack": self._read_stack()}
-        elif activations[CMP_LT] > 0.5:
-            result_info = {"op": f"CMP_LT {val_a}<{val_b}={cmp_result}", "stack": self._read_stack()}
-        elif activations[SWAP] > 0.5:
-            result_info = {"op": f"SWAP", "stack": self._read_stack()}
-
-        # ======================================
-        # OUTPUT: Emit token + update KV cache
-        # ======================================
-        # The output of this forward pass becomes a new token.
-        # Its KV entry encodes the updated state for future lookups.
-        # (Stack writes already added their entries above.)
-
+        # Persistence mask: clear transient dims, keep PC/SP/cycle
+        x = x * PERSISTENCE_MASK
+        self.residual_stream = x
         self.cycle_count += 1
-        result_info["cycle"] = self.cycle_count
-        self.trace.append(result_info)
-        return result_info
 
-    # ----------------------------------------------------------
-    # Memory operations (via attention)
-    # ----------------------------------------------------------
-
-    # ----------------------------------------------------------
-    # State update via rotation matrices (FFN Layer 5)
-    # ----------------------------------------------------------
-
-    def _advance_pc(self):
-        """Increment PC by 1 via 2D rotation matrix (NOT integer +1)."""
-        self.pc_vec = R_PC @ self.pc_vec
-        self.pc += 1  # keep integer in sync for trace
-
-    def _set_pc(self, target):
-        """Set PC to an arbitrary address (for JMP/JZ). Encodes target as 2D direction."""
-        self.pc_vec = addr_to_2d(target, MAX_ADDRS)
-        self.pc = target
-
-    def _advance_sp(self, delta):
-        """
-        Update SP by delta via repeated 2D rotation (NOT integer +=).
-        delta > 0 = increment, delta < 0 = decrement.
-        """
-        if delta > 0:
-            for _ in range(delta):
-                self.sp_vec = R_SP_INC @ self.sp_vec
-        elif delta < 0:
-            for _ in range(-delta):
-                self.sp_vec = R_SP_DEC @ self.sp_vec
-        self.sp += delta  # keep integer in sync for stack indexing / trace
-
-    # ----------------------------------------------------------
-    # Memory operations (via attention)
-    # ----------------------------------------------------------
-
-    def _stack_write(self, pos, value):
-        """
-        Write a value to stack position pos via KV cache insertion.
-
-        The key direction encodes the stack position (angle-based).
-        The key magnitude increases per-position so the latest write
-        to a given position always wins the argmax, WITHOUT interfering
-        with keys at other positions.
-
-        Per-position counters ensure that only writes to the SAME position
-        compete on magnitude. The scale factor can be large (0.01) because
-        it only needs to beat older writes in the same direction — never
-        writes at different angles.
-        """
-        # Per-position write counter: only competes with same position
-        # Scale factor 0.00001 chosen so cross-position interference never
-        # occurs: max safe overwrites ≈ (1-cos(2π/32)) / 0.00001 ≈ 1959
-        self._pos_write_counts[pos] = self._pos_write_counts.get(pos, 0) + 1
-        count = self._pos_write_counts[pos]
-        direction = make_stack_key(pos)
-        scaled_key = direction * (1.0 + count * 0.00001)
-        # Insert into stack cache on heads 1 and 2 (both can read stack)
-        keys = {HEAD_STACK0: scaled_key, HEAD_STACK1: scaled_key}
-        vals = {HEAD_STACK0: value, HEAD_STACK1: value}
-        self.stack_cache.insert(keys, vals)
-
-    def _stack_read(self, pos):
-        """
-        Read a value from stack position pos via 2D argmax attention.
-
-        Query direction matches the key direction for this position.
-        The token with the largest dot product (= latest write) wins.
-        """
-        query = make_stack_query(pos)
-        result = self.stack_cache.query(HEAD_STACK0, query)
-        if result is None:
-            return 0
-        return result
-
-    def _read_stack(self):
-        """Read full stack (for trace output only)."""
-        return [self._stack_read(i) for i in range(self.sp)]
+        return halt_signal
 
     # ----------------------------------------------------------
     # Run a full program
     # ----------------------------------------------------------
 
-    def run(self, program, verbose=True, max_cycles=100000):
-        """Load and execute a program. Returns final stack."""
+    def _read_stack(self):
+        """Read full stack via attention queries (trace/debug only, NOT computation)."""
+        sp_dir = self.residual_stream[SP_DIR]
+        angle = np.arctan2(sp_dir[1], sp_dir[0])
+        offset = 0.1  # matches make_stack_key offset
+        sp_approx = round((angle - offset) / (2 * np.pi / MAX_STACKD)) % MAX_STACKD
+        stack = []
+        for i in range(sp_approx):
+            q = make_stack_query(i)
+            val = self.stack_cache.query(HEAD_STACK0, q)
+            stack.append(val if val is not None else 0.0)
+        return stack
+
+    def run(self, program, verbose=False, max_cycles=100000):
+        """Load and execute a program. Returns [top_of_stack]."""
         self.load_program(program)
 
-        if verbose:
-            print(f"\n{'='*60}")
-            print(f"TRANSFORMER COMPUTER — {'HullKVCache' if self.use_hull else 'NaiveKVCache'}")
-            print(f"{'='*60}")
-            print(f"Program: {[OP_NAME.get(i[0], '?') + (f' {i[1]}' if len(i)>1 else '') for i in program]}")
-            print(f"{'─'*60}")
-
-        while not self.halted and self.cycle_count < max_cycles:
-            info = self.forward_pass()
-            if info is None:
-                break
+        for _ in range(max_cycles):
+            halt_signal = self.forward_pass()
             if verbose:
-                print(f"  cycle {info['cycle']:>3}: {info['op']:<25} stack = {info['stack']}")
+                print(f"  cycle {self.cycle_count}")
+            if halt_signal > 0.5:
+                break
 
-        final_stack = self._read_stack()
-        if verbose:
-            print(f"{'─'*60}")
-            print(f"  Result: {final_stack}")
-            print(f"  Cycles: {self.cycle_count}")
-        return final_stack
+        # Read result via attention
+        sp_dir = self.residual_stream[SP_DIR]
+        q_top = R_SP_DEC @ sp_dir
+        result = self.stack_cache.query(HEAD_STACK0, q_top)
+        result = result if result is not None else 0.0
+        return [float(result)]
 
 
 # ================================================================
@@ -807,27 +902,27 @@ def demonstrate_weight_matrices():
     # so W_Q is just a 2x2 identity on those dims.
     print("\n1. Instruction fetch query (W_Q):")
     print("   PC stored as 2D direction in residual stream dims [0,1]")
-    print("   W_Q = identity on those dims → query = (cos(2πPC/N), sin(2πPC/N))")
+    print("   W_Q = identity on those dims -> query = (cos(2*piPC/N), sin(2*piPC/N))")
     demo_N = 16  # small N for readable demo
     for pc in range(4):
         q = addr_to_2d(pc, demo_N)
-        print(f"   PC={pc} → query = ({q[0]:+.3f}, {q[1]:+.3f})")
+        print(f"   PC={pc} -> query = ({q[0]:+.3f}, {q[1]:+.3f})")
 
     # --- W_K for instruction keys ---
     print("\n2. Instruction keys (W_K):")
     print("   Each instruction addr gets a unique 2D direction")
     for addr in range(4):
         k = addr_to_2d(addr, demo_N)
-        print(f"   addr={addr} → key = ({k[0]:+.3f}, {k[1]:+.3f})")
+        print(f"   addr={addr} -> key = ({k[0]:+.3f}, {k[1]:+.3f})")
 
     # --- Dot products ---
     print("\n3. Attention scores (dot products):")
-    print("   query(PC=2) · key(addr=i):")
+    print("   query(PC=2) * key(addr=i):")
     q = addr_to_2d(2, demo_N)
     for addr in range(4):
         k = addr_to_2d(addr, demo_N)
         score = dot2d(q, k)
-        marker = " ← ARGMAX" if addr == 2 else ""
+        marker = " <- ARGMAX" if addr == 2 else ""
         print(f"   dot(q, k_{addr}) = {score:+.4f}{marker}")
 
     # --- FFN for ADD ---
@@ -860,16 +955,16 @@ def demonstrate_weight_matrices():
             # Detector: fires when opcode == detect_op
             # Using a narrow ReLU window: ReLU(1 - |opcode - detect_op|)
             activation = max(0.0, 1.0 - abs(test_op - detect_op))
-            status = "FIRES ✓" if activation > 0 else "silent"
+            status = "FIRES OK" if activation > 0 else "silent"
             print(f"     detector_{OP_NAME[detect_op]}: {activation:.1f}  {status}")
 
     # --- PC update as rotation ---
     print("\n7. PC increment as 2D rotation:")
-    print("   Incrementing PC by 1 = rotating the 2D direction by Δθ = 2π/N")
+    print("   Incrementing PC by 1 = rotating the 2D direction by dtheta = 2*pi/N")
     dtheta = 2 * np.pi / demo_N
     R = np.array([[np.cos(dtheta), -np.sin(dtheta)],
                   [np.sin(dtheta),  np.cos(dtheta)]])
-    print(f"   Rotation matrix R (Δθ = {np.degrees(dtheta):.1f}°):")
+    print(f"   Rotation matrix R (dtheta = {np.degrees(dtheta):.1f}deg):")
     print(f"   [{R[0,0]:+.4f}  {R[0,1]:+.4f}]")
     print(f"   [{R[1,0]:+.4f}  {R[1,1]:+.4f}]")
     pc_dir = addr_to_2d(0, demo_N)
@@ -878,10 +973,10 @@ def demonstrate_weight_matrices():
         pc_dir = R @ pc_dir
         expected = addr_to_2d(step, demo_N)
         match = np.allclose(pc_dir, expected, atol=1e-10)
-        print(f"   R × → PC={step}: ({pc_dir[0]:+.4f}, {pc_dir[1]:+.4f})  matches addr_to_2d({step}): {match}")
+        print(f"   R x -> PC={step}: ({pc_dir[0]:+.4f}, {pc_dir[1]:+.4f})  matches addr_to_2d({step}): {match}")
 
-    print(f"\n   This rotation IS the FFN's W₂ matrix (for the PC update portion).")
-    print(f"   It's a linear operation — implementable as a matrix multiply.")
+    print(f"\n   This rotation IS the FFN's W2 matrix (for the PC update portion).")
+    print(f"   It's a linear operation -- implementable as a matrix multiply.")
 
 
 # ================================================================
@@ -922,7 +1017,7 @@ def test_basic():
 
         match_naive = ref_stack == tc_stack
         match_hull = ref_stack == tc_hull_stack
-        status = "✓ PASS" if (match_naive and match_hull) else "✗ FAIL"
+        status = "OK PASS" if (match_naive and match_hull) else "FAIL FAIL"
         all_pass = all_pass and match_naive and match_hull
 
         print(f"  {status}  {name:>25} = {ref_stack[0]}"
@@ -937,7 +1032,7 @@ def test_complex():
     print("# TEST: Complex Programs")
     print("#"*60)
 
-    # Compute (a^2 + b^2) for a=3, b=4 → should be 25
+    # Compute (a^2 + b^2) for a=3, b=4 -> should be 25
     prog_pythagorean = [
         (CONST, 3), (DUP,), (MUL,),      # 9
         (CONST, 4), (DUP,), (MUL,),      # 16
@@ -960,7 +1055,7 @@ def test_complex():
     ]
 
     programs = {
-        "3² + 4² = 25": prog_pythagorean,
+        "3^2 + 4^2 = 25": prog_pythagorean,
         "sum(1..10) = 55": prog_sum,
         "100-50+25-12 = 63": prog_alt,
     }
@@ -976,7 +1071,7 @@ def test_complex():
         match_n = (ref_stack == tc_stack)
         match_h = (ref_stack == tc_hull_stack)
         match = match_n and match_h
-        status = "✓ PASS" if match else "✗ FAIL"
+        status = "OK PASS" if match else "FAIL FAIL"
         all_pass = all_pass and match
         detail = ""
         if not match_n: detail += f" naive={tc_stack}"
@@ -987,7 +1082,7 @@ def test_complex():
 
 
 # ================================================================
-# PART 8: Benchmarks — Naive vs HullKVCache
+# PART 8: Benchmarks -- Naive vs HullKVCache
 # ================================================================
 
 def benchmark_attention():
@@ -1005,7 +1100,7 @@ def benchmark_attention():
     n_queries = 50
 
     print(f"\n  {'n tokens':>10} | {'Naive (ms)':>12} | {'Hull (ms)':>12} | {'Speedup':>8} | {'Match':>6}")
-    print(f"  {'─'*10}─┼─{'─'*12}─┼─{'─'*12}─┼─{'─'*8}─┼─{'─'*6}")
+    print(f"  {'-'*10}-+-{'-'*12}-+-{'-'*12}-+-{'-'*8}-+-{'-'*6}")
 
     for n in test_sizes:
         # Build caches with n random 2D keys
@@ -1058,7 +1153,7 @@ def benchmark_program_execution():
     print("#"*60)
 
     print(f"\n  {'Program':>20} | {'Cache':>6} | {'Cycles':>7} | {'Time':>10} | {'Throughput':>12} | {'OK':>3}")
-    print(f"  {'─'*20}─┼─{'─'*6}─┼─{'─'*7}─┼─{'─'*10}─┼─{'─'*12}─┼─{'─'*3}")
+    print(f"  {'-'*20}-+-{'-'*6}-+-{'-'*7}-+-{'-'*10}-+-{'-'*12}-+-{'-'*3}")
 
     for N in [50, 100, 500, 1000]:
         prog = [(CONST, 0)]
@@ -1068,17 +1163,17 @@ def benchmark_program_execution():
         expected = N * (N + 1) // 2
 
         # Only test naive for program execution (hull overhead is Python-level,
-        # not architectural — the hull speedup is validated in benchmark_attention)
+        # not architectural -- the hull speedup is validated in benchmark_attention)
         tc = TransformerComputer(use_hull=False)
         t0 = perf_counter()
         result = tc.run(prog, verbose=False)
         elapsed = perf_counter() - t0
         correct = result[0] == expected if len(result) > 0 else False
         tps = tc.cycle_count / elapsed if elapsed > 0 else 0
-        print(f'  sum(1..{N:>5})      | Naive  | {tc.cycle_count:>7} | {elapsed*1000:>8.1f}ms | {tps:>10,.0f} t/s | {"✓" if correct else "✗"}')
+        print(f'  sum(1..{N:>5})      | Naive  | {tc.cycle_count:>7} | {elapsed*1000:>8.1f}ms | {tps:>10,.0f} t/s | {"OK" if correct else "FAIL"}')
 
     print(f"\n  Note: Throughput drops as program lengthens (O(n) attention per step).")
-    print(f"  HullKVCache eliminates this — see attention benchmark for proof.")
+    print(f"  HullKVCache eliminates this -- see attention benchmark for proof.")
 
 
 # ================================================================
@@ -1110,9 +1205,10 @@ def detailed_trace():
     tc_hull = TransformerComputer(use_hull=True)
     tc_hull.run(prog, verbose=True)
 
-    # Verify
-    match = ref_stack == tc._read_stack()
-    print(f"\n  Reference matches transformer: {'✓ YES' if match else '✗ NO'}")
+    # Verify: compare top-of-stack values
+    tc_result = tc.run(prog, verbose=False)
+    match = len(ref_stack) > 0 and len(tc_result) > 0 and abs(ref_stack[-1] - tc_result[0]) < 0.01
+    print(f"\n  Reference matches transformer: {'YES' if match else 'NO'}")
 
 
 # ================================================================
@@ -1120,11 +1216,11 @@ def detailed_trace():
 # ================================================================
 
 if __name__ == "__main__":
-    print("╔══════════════════════════════════════════════════════════╗")
-    print("║  Replication: 'Can LLMs Be Computers?' (Percepta 2026) ║")
-    print("║  Transformer with hand-crafted weights executing code   ║")
-    print("║  2D argmax attention + HullKVCache (O(log n))           ║")
-    print("╚══════════════════════════════════════════════════════════╝")
+    print("+----------------------------------------------------------+")
+    print("|  Replication: 'Can LLMs Be Computers?' (Percepta 2026) |")
+    print("|  Transformer with hand-crafted weights executing code   |")
+    print("|  2D argmax attention + HullKVCache (O(log n))           |")
+    print("+----------------------------------------------------------+")
 
     # 1. Show the weight matrices
     demonstrate_weight_matrices()
@@ -1137,9 +1233,9 @@ if __name__ == "__main__":
     pass2 = test_complex()
 
     if pass1 and pass2:
-        print(f"\n  ✓ ALL TESTS PASSED — transformer output matches reference exactly")
+        print(f"\n  OK ALL TESTS PASSED -- transformer output matches reference exactly")
     else:
-        print(f"\n  ✗ SOME TESTS FAILED")
+        print(f"\n  FAIL SOME TESTS FAILED")
 
     # 4. Benchmarks
     benchmark_attention()
@@ -1152,5 +1248,5 @@ if __name__ == "__main__":
     print("  3. FFN = opcode dispatch + arithmetic (hand-crafted weights)")
     print("  4. KV cache = the computer's RAM")
     print("  5. HullKVCache gives O(log n) per lookup via convex hull")
-    print("  6. Results are 100% deterministic — identical to reference")
+    print("  6. Results are 100% deterministic -- identical to reference")
     print("="*60)

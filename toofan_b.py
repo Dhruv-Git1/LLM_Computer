@@ -475,10 +475,17 @@ class RealTransformerComputer:
       - self.residual_stream: np.array of shape (30,)
       - self.instr_cache: KV cache for instructions
       - self.stack_cache: KV cache for stack memory
+
+    Cache modes:
+      - use_hull=False (default): MatrixKVCache for both caches — O(n) attention
+      - use_hull=True: HullKVCache for instruction cache — O(log n) via convex hull
+        Stack cache stays MatrixKVCache because magnitude-scaled keys break the
+        unit-circle assumption required by convex hull.
     """
 
-    def __init__(self, max_tokens=4096):
+    def __init__(self, max_tokens=4096, use_hull=False):
         self.max_tokens = max_tokens
+        self.use_hull = use_hull
         # Build fixed weight matrices (these are the "hand-crafted weights")
         # Layer 2: Standard FFN (tent function opcode decode)
         self.W1_L2, self.b1_L2, self.W2_L2, self.b2_L2 = _build_layer2_weights()
@@ -522,7 +529,12 @@ class RealTransformerComputer:
         self.residual_stream[PC_DIR] = addr_to_2d(0, MAX_ADDRS)
         self.residual_stream[SP_DIR] = make_stack_key(0)
 
-        self.instr_cache = MatrixKVCache(n_heads=1, max_tokens=self.max_tokens)
+        # Instruction cache: HullKVCache (O(log n) convex hull) or MatrixKVCache (O(n))
+        # Hull works because instruction keys are unit vectors on the circle.
+        self.instr_cache = (HullKVCache(n_heads=1) if self.use_hull
+                            else MatrixKVCache(n_heads=1, max_tokens=self.max_tokens))
+        # Stack cache: always MatrixKVCache — magnitude-scaled keys for overwrite
+        # semantics break the unit-circle assumption required by convex hull.
         self.stack_cache = MatrixKVCache(n_heads=3, max_tokens=self.max_tokens)
 
         # Pre-seed stack cache with default 0.0 at a far location to eliminate None returns
